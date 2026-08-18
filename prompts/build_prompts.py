@@ -120,7 +120,9 @@ def main() -> int:
     ap.add_argument("--out", default="prompts/prompts.jsonl")
     ap.add_argument("--short-tokens", type=int, default=64)
     ap.add_argument("--long-tokens", type=int, default=2560)
-    ap.add_argument("--count", type=int, default=16, help="distinct prompts per set")
+    ap.add_argument("--count", type=int, default=200, help="distinct short prompts")
+    ap.add_argument("--long-count", type=int, default=64,
+                    help="distinct long prompts (fewer: only measured at concurrency 1)")
     ap.add_argument("--seed", type=int, default=20260818)
     args = ap.parse_args()
 
@@ -133,11 +135,12 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     rows = []
-    for prompt_set, target in (("short", args.short_tokens), ("long", args.long_tokens)):
-        for i in range(args.count):
-            rows.append(build_prompt(tok, rng, target, f"{prompt_set}_{i:02d}", prompt_set))
+    for prompt_set, target, count in (("short", args.short_tokens, args.count),
+                                      ("long", args.long_tokens, args.long_count)):
+        for i in range(count):
+            rows.append(build_prompt(tok, rng, target, f"{prompt_set}_{i:03d}", prompt_set))
         actual = {r["n_tokens"] for r in rows if r["prompt_set"] == prompt_set}
-        print(f"  {prompt_set}: {args.count} prompts, token counts {sorted(actual)}")
+        print(f"  {prompt_set}: {count} prompts, token counts {sorted(actual)}")
         if len(actual) != 1:
             raise SystemExit(
                 f"prompt set '{prompt_set}' has inconsistent lengths {sorted(actual)}; "

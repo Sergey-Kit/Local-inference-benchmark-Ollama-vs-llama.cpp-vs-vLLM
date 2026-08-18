@@ -38,6 +38,8 @@ class RequestRecord:
     # problems, and only finish_reason separates them.
     finish_reason: str | None = None
     n_chunks: int = 0
+    # Relative gap between the runtime's usage and our own tokenizer count.
+    token_drift: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -156,6 +158,9 @@ def summarize_run(
     sources = {r.token_count_source for r in ok}
     if sources - {"usage"}:
         notes.append(f"token counts from {sorted(sources)}")
+    drifts = [r.token_drift for r in ok if r.token_drift]
+    if drifts:
+        notes.append(f"tokenizer drift up to {max(drifts):.1%}")
 
     return RunSummary(
         runtime=head.runtime,

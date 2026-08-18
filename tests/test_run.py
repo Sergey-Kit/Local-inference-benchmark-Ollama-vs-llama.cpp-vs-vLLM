@@ -100,22 +100,30 @@ class TestMatrix:
         assert Point("prompt_length", "longctx", "long", 1) in points
         assert len(points) == 6
 
-    def test_enough_prompts_for_the_largest_run(self, cfg):
-        """One distinct prompt per request in the largest run.
+    def test_enough_prompts_for_every_run_plus_warmup(self, cfg):
+        """No prompt is ever seen twice by one server.
 
-        run_batch cycles the prompt list, so if a run issues more requests than
-        there are prompts, some prompts repeat -- and a repeat is a prefix-cache
-        hit waiting to happen. Prefix caching is disabled by flag as well, but
-        the data should not depend on the flag being honoured.
+        Each run takes its own window of the prompt list, and warm-up takes the
+        window past all of them. If the list is shorter than the sum, windows
+        wrap and a repeat becomes a prompt-cache hit -- which is not a small
+        effect: replaying run 0's prompts dropped llama.cpp's TTFT from 188 ms
+        to 24 ms, so the median of three runs would have described the cache
+        rather than the runtime.
         """
         if not PROMPTS.exists():
             pytest.skip("prompts not built yet")
         from bench.run import requests_for
         sets = load_prompts(PROMPTS)
-        widest = max(c for s in cfg["scenarios"] for c in s["concurrency"])
-        largest_run = requests_for(cfg["measurement"], widest)
-        assert len(sets["short"]) >= largest_run
-        assert len(sets["long"]) >= requests_for(cfg["measurement"], 1)
+        m = cfg["measurement"]
+        warmup = int(m["warmup_requests"])
+        for scenario in cfg["scenarios"]:
+            names = scenario["prompt_set"]
+            names = [names] if isinstance(names, str) else names
+            needed = max(requests_for(m, c) for c in scenario["concurrency"]) * int(m["n_runs"])
+            for name in names:
+                assert len(sets[name]) >= needed + warmup, (
+                    f"{name}: {len(sets[name])} prompts, need {needed + warmup}"
+                )
 
 
 class TestPrompts:

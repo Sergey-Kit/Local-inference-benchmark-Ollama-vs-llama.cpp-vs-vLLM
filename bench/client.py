@@ -64,7 +64,7 @@ class RuntimeClient:
         supports_ignore_eos: bool = True,
         timeout_s: float = 600.0,
         count_tokens: Callable[[str], int] | None = None,
-        token_mismatch_tolerance: float = 0.01,
+        token_mismatch_tolerance: float = 0.03,
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -241,7 +241,7 @@ class RuntimeClient:
 
         total_s = time.monotonic() - started
         completion = "".join(text_parts)
-        output_tokens, source = self._resolve_output_tokens(usage, completion)
+        output_tokens, source, drift = self._resolve_output_tokens(usage, completion)
         prompt_tokens = int(usage["prompt_tokens"]) if usage and "prompt_tokens" in usage else prompt.n_tokens
 
         # A trustworthy request is one that generated tokens AND was seen
@@ -264,13 +264,24 @@ class RuntimeClient:
             ok=failure is None,
             error=failure,
             token_count_source=source,
+            token_drift=drift,
             finish_reason=finish_reason,
             n_chunks=n_chunks,
             **record_kw,
         )
 
-    def _resolve_output_tokens(self, usage: dict | None, completion: str) -> tuple[int, str]:
-        """Prefer the runtime's usage, but never trust it blindly."""
+    def _resolve_output_tokens(
+        self, usage: dict | None, completion: str
+    ) -> tuple[int, str, float | None]:
+        """Prefer the runtime's usage, but never trust it blindly.
+
+        Returns (tokens, source, drift). A percent or two of drift is the
+        expected cost of the detokenise/retokenise round trip: we compare the
+        runtime's count against a re-tokenisation of the decoded text, and those
+        are not required to agree exactly. The tolerance sits above that noise
+        floor so the label stays meaningful, while the measured drift rides on
+        every record so the noise floor itself stays auditable.
+        """
         ours = self.count_tokens(completion) if self.count_tokens and completion else None
         theirs = None
         if usage and usage.get("completion_tokens") is not None:
@@ -278,18 +289,17 @@ class RuntimeClient:
 
         if theirs is None:
             if ours is None:
-                return 0, "unavailable"
-            return ours, "tokenizer"
+                return 0, "unavailable", None
+            return ours, "tokenizer", None
         if ours is None or theirs == 0:
-            return theirs, "usage"
+            return theirs, "usage", None
 
         drift = abs(theirs - ours) / max(theirs, 1)
         if drift > self.token_mismatch_tolerance:
-            # Recorded, not silently reconciled: a systematic disagreement
-            # means the runtimes are not tokenizing the same way, which is a
-            # finding about the comparison itself.
-            return theirs, f"usage(tokenizer_drift={drift:.1%})"
-        return theirs, "usage"
+            # Recorded, not silently reconciled: a disagreement this large is a
+            # finding about the comparison itself, not a rounding detail.
+            return theirs, "usage(tokenizer_disagrees)", drift
+        return theirs, "usage", drift
 
     # -- load generation ---------------------------------------------------
 
@@ -302,19 +312,26 @@ class RuntimeClient:
         concurrency: int,
         n_requests: int,
         run_index: int,
+        prompt_offset: int = 0,
     ) -> tuple[list[RequestRecord], float]:
         """Issue `n_requests` with at most `concurrency` in flight.
 
         A semaphore keeps exactly `concurrency` requests outstanding, which is
         what makes the throughput-vs-concurrency curve mean something: the
         server is asked to hold N streams open, not to absorb a burst of N.
+
+        `prompt_offset` advances the window into the prompt list. Without it
+        every run replays the same prompts, the runtime serves them from its
+        per-slot prompt cache, and TTFT collapses from run 1 onward -- measured
+        on llama.cpp at concurrency 1: 188 ms on the first run, 24 ms and 23 ms
+        on the next two. The median of three would then describe a cache hit.
         """
         sem = asyncio.Semaphore(concurrency)
 
         async def one(i: int) -> RequestRecord:
             async with sem:
                 return await self.one_request(
-                    prompts[i % len(prompts)],
+                    prompts[(prompt_offset + i) % len(prompts)],
                     sampling,
                     scenario=scenario,
                     concurrency=concurrency,
@@ -325,9 +342,16 @@ class RuntimeClient:
         records = await asyncio.gather(*(one(i) for i in range(n_requests)))
         return list(records), time.monotonic() - started
 
-    async def warmup(self, prompt: Prompt, sampling: Sampling, n: int = 8) -> None:
-        """Discarded traffic: fills caches and opens the connection pool."""
+    async def warmup(
+        self, prompts: Sequence[Prompt], sampling: Sampling, n: int = 8,
+        prompt_offset: int = 0,
+    ) -> None:
+        """Discarded traffic: fills caches and opens the connection pool.
+
+        Draws from its own window of the prompt list so it does not prime the
+        runtime's prompt cache with the prompts the measured runs will use.
+        """
         await self.run_batch(
-            [prompt], sampling, scenario="warmup", concurrency=min(n, 4),
-            n_requests=n, run_index=-1,
+            prompts, sampling, scenario="warmup", concurrency=min(n, 4),
+            n_requests=n, run_index=-1, prompt_offset=prompt_offset,
         )

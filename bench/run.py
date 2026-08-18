@@ -231,6 +231,7 @@ async def measure_point(
             concurrency=point.concurrency,
             n_requests=n_requests,
             run_index=run_index,
+            prompt_offset=run_index * n_requests,
         )
         res = monitor.stop()
         summary = summarize_run(
@@ -320,8 +321,17 @@ async def run_runtime(
                 print(f"    cold start: {cold_start_s:.1f} s "
                       f"(load peak {load_res.peak_vram_mib or float('nan'):.0f} MiB over baseline)")
 
-                warm_prompt = prompt_sets[profile_points[0].prompt_set][0]
-                await client.warmup(warm_prompt, sampling, n=int(measurement["warmup_requests"]))
+                # Warm up from the tail of the list, past every window the
+                # measured runs will touch, so it cannot prime the prompt cache
+                # for a prompt that is about to be measured.
+                warm_set = prompt_sets[profile_points[0].prompt_set]
+                reserve = max(
+                    requests_for(measurement, p.concurrency) * int(measurement["n_runs"])
+                    for p in profile_points
+                )
+                await client.warmup(warm_set, sampling,
+                                    n=int(measurement["warmup_requests"]),
+                                    prompt_offset=reserve)
 
                 for point in profile_points:
                     print(f"    {point.scenario} / {point.prompt_set} / concurrency {point.concurrency} "
