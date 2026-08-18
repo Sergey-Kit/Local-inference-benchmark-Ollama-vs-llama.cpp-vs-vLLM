@@ -301,6 +301,35 @@ async def server_session(cfg, runtime, profile_name, profile, count_tokens, out_
         monitor.close()
 
 
+async def preflight(session: Session, prompt: Prompt) -> None:
+    """Refuse to measure a runtime that is not seeing the prompt we sent.
+
+    Every runtime is handed the same fully-rendered string, so every runtime
+    must report the same prompt length. When one does not, it is re-templating
+    or otherwise rewriting the input, and its prefill and TTFT numbers describe
+    a different prompt than everyone else's -- which is the single failure this
+    experiment exists to avoid, and which is otherwise completely silent.
+
+    Ollama's OpenAI layer failed exactly this way: 72 tokens where llama.cpp
+    reported 64, because it applied the chat template a second time.
+    """
+    record = await session.client.one_request(
+        prompt, Sampling(max_tokens=8), scenario="preflight", concurrency=1, run_index=-1
+    )
+    if not record.ok:
+        raise SystemExit(
+            f"{session.client.name} failed its preflight request: {record.error}"
+        )
+    if record.prompt_tokens != prompt.n_tokens:
+        raise SystemExit(
+            f"{session.client.name} reports {record.prompt_tokens} prompt tokens for a "
+            f"{prompt.n_tokens}-token prompt -- it is rewriting the input, so its "
+            f"prefill and TTFT are not comparable with the other runtimes. "
+            f"Check the runtime's `api:` style in configs/experiment.yaml."
+        )
+    print(f"    preflight ok: prompt round-trips as {record.prompt_tokens} tokens")
+
+
 async def warm_up(session: Session, prompts, sampling, measurement, profile_points) -> None:
     """Discarded traffic, drawn from past every window the measured runs use."""
     reserve = max(
@@ -420,6 +449,8 @@ async def run_runtime(
                                               count_tokens, out_dir,
                                               label=f"run {run_index}: ") as session:
                         baseline = session.baseline_mib
+                        if run_index == 0:
+                            await preflight(session, prompt_sets[point.prompt_set][0])
                         await warm_up(session, prompt_sets[point.prompt_set], sampling,
                                       measurement, [point])
                         summaries.append(await one_run(
@@ -430,6 +461,7 @@ async def run_runtime(
         else:
             async with server_session(cfg, runtime, profile_name, profile,
                                       count_tokens, out_dir) as session:
+                await preflight(session, prompt_sets[profile_points[0].prompt_set][0])
                 await warm_up(session, prompt_sets[profile_points[0].prompt_set],
                               sampling, measurement, profile_points)
                 for point in profile_points:
