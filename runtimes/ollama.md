@@ -56,13 +56,46 @@ OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_FLASH_ATTENTION=0 \
   explicitly so the configuration is stated rather than inferred.
 * `OLLAMA_CONTEXT_LENGTH` is **per slot** here, unlike llama.cpp's `-c`.
 
+## Endpoint: the native API, not the OpenAI one
+
+`http://127.0.0.1:11434/api/generate` with `raw: true`.
+
+This is the one place the benchmark deviates from "same endpoint everywhere",
+and it is not a preference. Ollama's OpenAI-compatible `/v1/completions`
+**re-applies the chat template to a prompt that already carries one**:
+
+| endpoint | prompt_tokens | output begins |
+|---|---|---|
+| `/v1/completions` | **72** | `<think>\n…` |
+| `/api/generate`, `raw: true` | **64** | the answer |
+
+llama.cpp reports 64 for the same string. The extra wrapping also switches
+Qwen3's thinking mode back on, so the model spends its budget emitting a
+`<think>` block and runs into `max_tokens` -- 128 tokens in 141 of 408
+requests, against llama.cpp's natural ~63. Measured that way, Ollama was doing
+different work on a different prompt, and nothing in the response said so.
+`raw: true` passes the string through untouched.
+
+`bench/run.py` now preflights every runtime and aborts unless it reports the
+prompt length that was sent, so this class of mismatch cannot recur silently.
+
+## Do not set OLLAMA_FLASH_ATTENTION
+
+It was set to `0` here on the reasoning that sm75 has no FlashAttention-2 and
+the configuration should be explicit rather than inferred. Measured cost:
+
+| | TTFT p50 |
+|---|---|
+| `OLLAMA_FLASH_ATTENTION=0` | **3074 ms** |
+| unset | **570 ms** |
+
+Everything else identical. Ollama's startup log prints `FLASH_ATTENTION:false`
+in **both** cases, so the setting responsible for a 5.4x difference does not
+appear in the configuration the server reports. Leaving it unset also matches
+llama-server, which is likewise left on its default.
+
 ## Known deviation
 
-Ollama's OpenAI-compatible layer does not forward `ignore_eos`, so unlike the
-other two runtimes it may stop before `max_tokens`. The client records this
-(`supports_ignore_eos: false` in the config) and falls back to counting the
-tokens actually returned. Listed under "Limitations" in the README.
-
-## Endpoint
-
-`http://127.0.0.1:11434/v1/completions`
+Ollama does not support `ignore_eos`. The benchmark runs without it on every
+runtime for that reason among others, so this is no longer an asymmetry --
+see the README's Limitations.

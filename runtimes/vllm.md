@@ -77,6 +77,43 @@ If the server fails to start, in this order:
    runtime does not run on this class of hardware" is a legitimate and useful
    on-prem finding.
 
-## Status
+## Status: runs, and the GPU was never the problem
 
-<!-- filled in once the runtime has actually been exercised on this bench -->
+The expectation going in was that Turing would block it. Compute capability 7.5
+never came up. Three unrelated environment issues did, and each killed the
+engine at startup rather than degrading anything:
+
+1. **`RuntimeError: UVA is not available`.** vLLM disables pinned memory under
+   WSL by default, and its engine then requires UVA, which requires pinned
+   memory. Fixed with `VLLM_WSL2_ENABLE_PIN_MEMORY=1` -- vLLM's own opt-in for
+   WSL2 kernels past 4.19.121 (ours is 6.18). Pinned allocation was verified
+   working directly before enabling it.
+2. **`TypeError: 'type' object is not subscriptable`** from flashinfer, which
+   annotates with `array.array[int]` -- subscriptable only from Python 3.11.
+   Ubuntu 22.04 ships 3.10 and 3.11 needs root. Uninstall flashinfer and set
+   `VLLM_USE_FLASHINFER_SAMPLER=0`, which stops the sampler probing for it by
+   import.
+3. **`--disable-log-requests` was removed in 0.27** and makes `vllm serve` exit
+   immediately with "unrecognized arguments".
+
+It then starts in ~60 s on **TRITON_ATTN** with 1.9 GiB of KV cache -- 17,792
+tokens, about 34 concurrent 512-token sequences.
+
+### Measured
+
+| concurrency | 1 | 4 | 8 | 16 |
+|---|---|---|---|---|
+| tok/s | 12.5 | 20.7 | 38.3 | 68.6 |
+| TTFT p50, ms | 308 | 644 | 696 | 775 |
+| TPOT p50, ms | 76.3 | 175.9 | 180.9 | 200.2 |
+
+Scaling from 1 to 16 concurrent requests is **x5.48**, against llama.cpp's
+x2.14 -- continuous batching doing exactly what it claims. It still loses in
+absolute terms at every point measured, because 76 ms/token at concurrency 1 is
+a very deep hole to climb out of, and that number is `--enforce-eager`: CUDA
+graph capture is what removes vLLM's per-step Python overhead, and it needs
+VRAM this card does not have. On a 0.6B model that overhead is most of the step.
+
+The crossover implied by the two curves sits past concurrency 30, which this
+card's KV budget could just about reach. That measurement is the obvious next
+step and is listed in the README.
