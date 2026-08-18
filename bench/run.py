@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,49 +212,109 @@ def requests_for(measurement: dict, concurrency: int) -> int:
     )
 
 
-async def measure_point(
-    client: RuntimeClient,
+@dataclass
+class Session:
+    """A live server plus the client and monitor bound to it."""
+
+    client: RuntimeClient
+    monitor: ResourceMonitor
+    baseline_mib: float | None
+    cold_start_s: float
+
+
+@asynccontextmanager
+async def server_session(cfg, runtime, profile_name, profile, count_tokens, out_dir, label=""):
+    """Bring one runtime up, hand back a Session, and guarantee it goes away.
+
+    The VRAM baseline is captured inside here, immediately before launch and
+    never reused across launches: it is the Windows desktop's share of the card
+    and it drifts by hundreds of MiB over a session.
+    """
+    rt = cfg["runtimes"][runtime]
+    vars_ = substitution_vars(cfg, profile)
+    manager = ServerManager(cfg, runtime, out_dir)
+    monitor = ResourceMonitor(
+        poll_interval_s=float(cfg["monitor"]["poll_interval_s"]),
+        baseline_settle_s=float(cfg["monitor"]["baseline_settle_s"]),
+    )
+    baseline = monitor.capture_baseline()
+    try:
+        proc = manager.launch(profile_name, profile)
+        monitor.track_pid(proc.pid)
+        async with RuntimeClient(
+            runtime,
+            rt["base_url"],
+            _fmt(rt["served_model"], vars_),
+            health_path=rt.get("health_path", "/health"),
+            supports_ignore_eos=bool(rt.get("supports_ignore_eos", True)),
+            timeout_s=float(cfg["measurement"]["request_timeout_s"]),
+            count_tokens=count_tokens,
+        ) as client:
+            monitor.start()
+            try:
+                cold_start_s = await client.wait_ready(timeout_s=900.0)
+            finally:
+                load_res = monitor.stop()
+            manager.check_alive()
+            print(f"    {label}cold start {cold_start_s:5.1f} s | baseline "
+                  f"{baseline or float('nan'):.0f} MiB | load peak "
+                  f"{load_res.peak_vram_mib or float('nan'):.0f} MiB over baseline")
+            yield Session(client, monitor, baseline, cold_start_s)
+    finally:
+        manager.terminate()
+        monitor.close()
+
+
+async def warm_up(session: Session, prompts, sampling, measurement, profile_points) -> None:
+    """Discarded traffic, drawn from past every window the measured runs use."""
+    reserve = max(
+        requests_for(measurement, p.concurrency) * int(measurement["n_runs"])
+        for p in profile_points
+    )
+    await session.client.warmup(
+        prompts, sampling, n=int(measurement["warmup_requests"]), prompt_offset=reserve
+    )
+
+
+async def one_run(
+    session: Session,
     point: Point,
     prompts: list[Prompt],
     sampling: Sampling,
-    monitor: ResourceMonitor,
     measurement: dict,
+    run_index: int,
     cold_start_s: float | None,
-) -> list[RunSummary]:
-    summaries: list[RunSummary] = []
+) -> RunSummary:
     n_requests = requests_for(measurement, point.concurrency)
-    for run_index in range(int(measurement["n_runs"])):
-        monitor.start()
-        records, wall = await client.run_batch(
-            prompts,
-            sampling,
-            scenario=point.scenario,
-            concurrency=point.concurrency,
-            n_requests=n_requests,
-            run_index=run_index,
-            prompt_offset=run_index * n_requests,
-        )
-        res = monitor.stop()
-        summary = summarize_run(
-            records,
-            wall_clock_s=wall,
-            peak_vram_mib=res.peak_vram_mib,
-            peak_rss_mib=res.peak_rss_mib,
-            # Cold start belongs to the server, not the run; attached to run 0
-            # so it survives into the aggregate without being counted n_runs times.
-            cold_start_s=cold_start_s if run_index == 0 else None,
-        )
-        summary.notes.extend(res.notes)
-        summaries.append(summary)
-        summary._records = records  # type: ignore[attr-defined]
-        print(
-            f"      run {run_index}: {summary.throughput_tok_s:7.2f} tok/s  "
-            f"TTFT p50 {summary.ttft_ms_p50 or float('nan'):7.1f} ms  "
-            f"TPOT p50 {summary.tpot_ms_p50 or float('nan'):6.2f} ms  "
-            f"peakVRAM {summary.peak_vram_mib or float('nan'):7.1f} MiB"
-            + (f"  [{'; '.join(summary.notes)}]" if summary.notes else "")
-        )
-    return summaries
+    session.monitor.start()
+    records, wall = await session.client.run_batch(
+        prompts,
+        sampling,
+        scenario=point.scenario,
+        concurrency=point.concurrency,
+        n_requests=n_requests,
+        run_index=run_index,
+        prompt_offset=run_index * n_requests,
+    )
+    res = session.monitor.stop()
+    summary = summarize_run(
+        records,
+        wall_clock_s=wall,
+        peak_vram_mib=res.peak_vram_mib,
+        peak_rss_mib=res.peak_rss_mib,
+        cold_start_s=cold_start_s,
+    )
+    summary.notes.extend(res.notes)
+    summary._records = records  # type: ignore[attr-defined]
+    print(
+        f"      run {run_index}: {summary.throughput_tok_s:7.2f} tok/s  "
+        f"TTFT p50 {summary.ttft_ms_p50 or float('nan'):7.1f} ms  "
+        f"TPOT p50 {summary.tpot_ms_p50 or float('nan'):6.2f} ms  "
+        f"peakVRAM {summary.peak_vram_mib or float('nan'):7.1f} MiB  "
+        f"RSS {summary.peak_rss_mib or float('nan'):7.0f} MiB"
+        + (f"  [{'; '.join(summary.notes)}]" if summary.notes else "")
+    )
+    return summary
 
 
 async def run_runtime(
@@ -265,7 +326,6 @@ async def run_runtime(
     raw_writer,
     on_point=None,
 ) -> list[dict]:
-    rt = cfg["runtimes"][runtime]
     sampling = Sampling(**cfg["sampling"])
     measurement = cfg["measurement"]
     aggregates: list[dict] = []
@@ -280,81 +340,72 @@ async def run_runtime(
     def count_tokens(text: str) -> int:
         return len(tokenizer(text, add_special_tokens=False).input_ids)
 
-    # Group by server profile: one launch per profile, not per point.
     by_profile: dict[str, list[Point]] = {}
     for point in points:
         by_profile.setdefault(point.profile, []).append(point)
 
+    def finish(point: Point, summaries: list[RunSummary], profile_name: str,
+               baseline: float | None) -> None:
+        for summary in summaries:
+            for record in getattr(summary, "_records", []):
+                raw_writer(record.as_dict())
+        agg = median_across_runs(summaries)
+        agg["profile"] = profile_name
+        agg["prompt_tokens"] = prompt_sets[point.prompt_set][0].n_tokens
+        agg["max_tokens"] = sampling.max_tokens
+        agg["requests_per_run"] = requests_for(measurement, point.concurrency)
+        agg["vram_baseline_mib"] = baseline
+        aggregates.append(agg)
+        if on_point is not None:
+            on_point(agg)
+
     for profile_name, profile_points in by_profile.items():
         profile = cfg["server_profiles"][profile_name]
-        vars_ = substitution_vars(cfg, profile)
+        restart = bool(profile.get("restart_between_runs", False))
+        n_runs = int(measurement["n_runs"])
         print(f"\n  [{runtime}] profile '{profile_name}' "
-              f"(parallel={profile['parallel']}, ctx/slot={profile['ctx_per_slot']})")
+              f"(parallel={profile['parallel']}, ctx/slot={profile['ctx_per_slot']}"
+              f"{', fresh server per run' if restart else ''})")
 
-        manager = ServerManager(cfg, runtime, out_dir)
-        monitor = ResourceMonitor(
-            poll_interval_s=float(cfg["monitor"]["poll_interval_s"]),
-            baseline_settle_s=float(cfg["monitor"]["baseline_settle_s"]),
-        )
-        baseline = monitor.capture_baseline()
-        print(f"    VRAM baseline: {baseline:.0f} MiB" if baseline else "    VRAM baseline: n/a")
-
-        try:
-            proc = manager.launch(profile_name, profile)
-            monitor.track_pid(proc.pid)
-
-            async with RuntimeClient(
-                runtime,
-                rt["base_url"],
-                _fmt(rt["served_model"], vars_),
-                health_path=rt.get("health_path", "/health"),
-                supports_ignore_eos=bool(rt.get("supports_ignore_eos", True)),
-                timeout_s=float(measurement["request_timeout_s"]),
-                count_tokens=count_tokens,
-            ) as client:
-                monitor.start()
-                try:
-                    cold_start_s = await client.wait_ready(timeout_s=600.0)
-                finally:
-                    load_res = monitor.stop()
-                manager.check_alive()
-                print(f"    cold start: {cold_start_s:.1f} s "
-                      f"(load peak {load_res.peak_vram_mib or float('nan'):.0f} MiB over baseline)")
-
-                # Warm up from the tail of the list, past every window the
-                # measured runs will touch, so it cannot prime the prompt cache
-                # for a prompt that is about to be measured.
-                warm_set = prompt_sets[profile_points[0].prompt_set]
-                reserve = max(
-                    requests_for(measurement, p.concurrency) * int(measurement["n_runs"])
-                    for p in profile_points
-                )
-                await client.warmup(warm_set, sampling,
-                                    n=int(measurement["warmup_requests"]),
-                                    prompt_offset=reserve)
-
+        if restart:
+            # One server per run. Costs a cold start each time, and buys two
+            # things: runs become genuinely independent replicates rather than
+            # successive states of one long-lived process, and a runtime that
+            # leaks host memory cannot accumulate across a whole profile.
+            # llama-server leaks ~295 MiB per 2560-token request on this build,
+            # which is enough to get it OOM-killed part-way through a 5.5 GB
+            # box -- and a run that dies mid-measurement is worse than a slow one.
+            for point in profile_points:
+                print(f"    {point.scenario} / {point.prompt_set} / concurrency "
+                      f"{point.concurrency} ({requests_for(measurement, point.concurrency)} requests/run)")
+                summaries, baseline = [], None
+                for run_index in range(n_runs):
+                    async with server_session(cfg, runtime, profile_name, profile,
+                                              count_tokens, out_dir,
+                                              label=f"run {run_index}: ") as session:
+                        baseline = session.baseline_mib
+                        await warm_up(session, prompt_sets[point.prompt_set], sampling,
+                                      measurement, [point])
+                        summaries.append(await one_run(
+                            session, point, prompt_sets[point.prompt_set], sampling,
+                            measurement, run_index, session.cold_start_s,
+                        ))
+                finish(point, summaries, profile_name, baseline)
+        else:
+            async with server_session(cfg, runtime, profile_name, profile,
+                                      count_tokens, out_dir) as session:
+                await warm_up(session, prompt_sets[profile_points[0].prompt_set],
+                              sampling, measurement, profile_points)
                 for point in profile_points:
-                    print(f"    {point.scenario} / {point.prompt_set} / concurrency {point.concurrency} "
-                          f"({requests_for(measurement, point.concurrency)} requests/run)")
-                    summaries = await measure_point(
-                        client, point, prompt_sets[point.prompt_set], sampling,
-                        monitor, measurement, cold_start_s,
-                    )
-                    for summary in summaries:
-                        for record in getattr(summary, "_records", []):
-                            raw_writer(record.as_dict())
-                    agg = median_across_runs(summaries)
-                    agg["profile"] = profile_name
-                    agg["prompt_tokens"] = prompt_sets[point.prompt_set][0].n_tokens
-                    agg["max_tokens"] = sampling.max_tokens
-                    agg["requests_per_run"] = requests_for(measurement, point.concurrency)
-                    agg["vram_baseline_mib"] = baseline
-                    aggregates.append(agg)
-                    if on_point is not None:
-                        on_point(agg)
-        finally:
-            manager.terminate()
-            monitor.close()
+                    print(f"    {point.scenario} / {point.prompt_set} / concurrency "
+                          f"{point.concurrency} ({requests_for(measurement, point.concurrency)} requests/run)")
+                    summaries = [
+                        await one_run(session, point, prompt_sets[point.prompt_set], sampling,
+                                      measurement, i,
+                                      session.cold_start_s if i == 0 else None)
+                        for i in range(n_runs)
+                    ]
+                    finish(point, summaries, profile_name, session.baseline_mib)
 
     return aggregates
 

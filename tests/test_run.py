@@ -197,3 +197,19 @@ class TestNoProxy:
                 assert not transport, f"proxy mounts configured: {transport}"
 
         asyncio.run(check())
+
+
+class TestRestartPolicy:
+    def test_longctx_restarts_between_runs(self, cfg):
+        """The long-prompt profile must not reuse a leaking server across runs.
+
+        llama-server grows ~295 MiB of host RSS per 2560-token request here;
+        3 runs x 16 requests on one server exceeds 5.5 GB of RAM and the kernel
+        kills it part-way through the measurement.
+        """
+        assert cfg["server_profiles"]["longctx"].get("restart_between_runs") is True
+
+    def test_interactive_reuses_one_server(self, cfg):
+        # Short prompts leak far less, and a cold start per run would dominate
+        # the concurrency sweep's wall clock for no gain in fidelity.
+        assert not cfg["server_profiles"]["interactive"].get("restart_between_runs", False)

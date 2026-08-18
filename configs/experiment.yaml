@@ -54,6 +54,16 @@ server_profiles:
   longctx:                # one slot, room for a ~2.5k-token prompt
     parallel: 1
     ctx_per_slot: 4096    # 4096 tokens ~= 448 MiB KV
+    # A fresh server for every run. llama-server leaks host RAM per request on
+    # this build -- roughly 70 MiB fixed plus 70 KiB per prompt token, so about
+    # 295 MiB for a 2560-token prompt -- and 5.5 GB of RAM buys about sixteen
+    # of those before the kernel OOM-kills it mid-measurement. (Confirmed by
+    # dmesg: "Out of memory: Killed process llama-server, anon-rss 4871812kB".
+    # Not CUDA graph caching and not glibc arena fragmentation: disabling
+    # GGML_CUDA_DISABLE_GRAPHS and pinning MALLOC_ARENA_MAX both leave the
+    # slope unchanged.) Restarting also makes the runs independent replicates
+    # rather than successive states of one increasingly degraded process.
+    restart_between_runs: true
 
 scenarios:
   - name: concurrency_sweep
