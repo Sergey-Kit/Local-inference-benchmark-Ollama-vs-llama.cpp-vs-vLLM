@@ -39,6 +39,122 @@ class Sampling:
     ignore_eos: bool = True
 
 
+class ApiStyle:
+    """How one runtime wants a completion asked for and streamed back.
+
+    The measuring code -- when the clock starts, what counts as the first
+    token, how tokens are counted, what makes a request trustworthy -- is the
+    same for every runtime. Only the shape of the request and of the stream
+    differs, and that is a property of the runtime, so it lives in the config
+    beside its launch flags rather than in branches through the client.
+    """
+
+    name = "openai"
+    path = "/completions"
+
+    def payload(self, model: str, prompt: str, sampling: "Sampling",
+                ignore_eos: bool) -> dict:
+        body = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": sampling.max_tokens,
+            "temperature": sampling.temperature,
+            "top_p": sampling.top_p,
+            "stream": True,
+            # Without this a streamed response carries no usage block at all,
+            # and we would be left counting words -- which SPEC section 3
+            # explicitly warns against.
+            "stream_options": {"include_usage": True},
+        }
+        if ignore_eos:
+            body["ignore_eos"] = True
+        return body
+
+    def parse(self, line: str) -> dict | None:
+        """SSE: `data: {...}`, terminated by `data: [DONE]`."""
+        if not line.startswith("data:"):
+            return None
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return {"_done": True}
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+        out: dict = {}
+        if chunk.get("error"):
+            err = chunk["error"]
+            out["_error"] = str(err.get("message", err))[:200]
+            return out
+        if chunk.get("usage"):
+            out["_usage"] = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            if choice.get("text"):
+                out["_text"] = choice["text"]
+            if choice.get("finish_reason"):
+                out["_finish"] = choice["finish_reason"]
+        return out
+
+
+class OllamaNativeStyle(ApiStyle):
+    """Ollama's own /api/generate with raw=True.
+
+    Not a preference. Ollama's OpenAI-compatible /v1/completions re-applies the
+    chat template to a prompt that already carries one: the same string arrives
+    as 72 tokens instead of 64, and the re-templating switches Qwen3's thinking
+    mode back on, so the model spends its budget emitting a <think> block and
+    runs into max_tokens. Measured against llama.cpp that is a different prompt
+    and a different task, which is precisely what this experiment forbids.
+    `raw: true` passes the prompt through untouched -- 64 tokens, matching
+    llama.cpp exactly.
+    """
+
+    name = "ollama_native"
+    path = "/api/generate"
+
+    def payload(self, model: str, prompt: str, sampling: "Sampling",
+                ignore_eos: bool) -> dict:
+        return {
+            "model": model,
+            "prompt": prompt,
+            "raw": True,          # no chat template, no added tokens
+            "stream": True,
+            "options": {
+                "num_predict": sampling.max_tokens,
+                "temperature": sampling.temperature,
+                "top_p": sampling.top_p,
+            },
+        }
+
+    def parse(self, line: str) -> dict | None:
+        """NDJSON: one object per line, the last carrying done=true."""
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        out: dict = {}
+        if chunk.get("error"):
+            out["_error"] = str(chunk["error"])[:200]
+            return out
+        if chunk.get("response"):
+            out["_text"] = chunk["response"]
+        if chunk.get("done"):
+            out["_done"] = True
+            out["_finish"] = chunk.get("done_reason") or "stop"
+            if chunk.get("eval_count") is not None:
+                out["_usage"] = {
+                    "prompt_tokens": chunk.get("prompt_eval_count"),
+                    "completion_tokens": chunk.get("eval_count"),
+                }
+        return out
+
+
+API_STYLES = {"openai": ApiStyle, "ollama_native": OllamaNativeStyle}
+
+
 @dataclass(frozen=True)
 class Prompt:
     name: str
@@ -65,6 +181,7 @@ class RuntimeClient:
         timeout_s: float = 600.0,
         count_tokens: Callable[[str], int] | None = None,
         token_mismatch_tolerance: float = 0.03,
+        api: str = "openai",
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -74,6 +191,9 @@ class RuntimeClient:
         self.timeout_s = timeout_s
         self.count_tokens = count_tokens
         self.token_mismatch_tolerance = token_mismatch_tolerance
+        if api not in API_STYLES:
+            raise ValueError(f"unknown api style {api!r}; expected one of {sorted(API_STYLES)}")
+        self.style: ApiStyle = API_STYLES[api]()
         self._client: httpx.AsyncClient | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -116,16 +236,11 @@ class RuntimeClient:
         last_error: str | None = None
         while time.monotonic() < deadline:
             try:
+                probe = self.style.payload(self.served_model, "ping",
+                                           Sampling(max_tokens=1), False)
+                probe["stream"] = False
                 resp = await self.client.post(
-                    f"{self.base_url}/completions",
-                    json={
-                        "model": self.served_model,
-                        "prompt": "ping",
-                        "max_tokens": 1,
-                        "temperature": 0.0,
-                        "stream": False,
-                    },
-                    timeout=30.0,
+                    f"{self.base_url}{self.style.path}", json=probe, timeout=30.0
                 )
                 if resp.status_code == 200:
                     return time.monotonic() - started
@@ -148,23 +263,10 @@ class RuntimeClient:
     # -- measurement -------------------------------------------------------
 
     def _payload(self, prompt: str, sampling: Sampling) -> dict:
-        payload: dict = {
-            "model": self.served_model,
-            "prompt": prompt,
-            "max_tokens": sampling.max_tokens,
-            "temperature": sampling.temperature,
-            "top_p": sampling.top_p,
-            "stream": True,
-            # Without this, a streamed response carries no usage block at all
-            # and we would be left counting words -- which SPEC section 3
-            # explicitly warns against.
-            "stream_options": {"include_usage": True},
-        }
-        if sampling.ignore_eos and self.supports_ignore_eos:
-            # Makes every runtime emit exactly max_tokens, so TPOT and
-            # throughput are not skewed by differing stop behaviour.
-            payload["ignore_eos"] = True
-        return payload
+        return self.style.payload(
+            self.served_model, prompt, sampling,
+            sampling.ignore_eos and self.supports_ignore_eos,
+        )
 
     async def one_request(
         self,
@@ -193,7 +295,8 @@ class RuntimeClient:
 
         try:
             async with self.client.stream(
-                "POST", f"{self.base_url}/completions", json=self._payload(prompt.text, sampling)
+                "POST", f"{self.base_url}{self.style.path}",
+                json=self._payload(prompt.text, sampling),
             ) as resp:
                 if resp.status_code != 200:
                     body = (await resp.aread()).decode("utf-8", "replace")[:300]
@@ -201,39 +304,30 @@ class RuntimeClient:
                         f"HTTP {resp.status_code}: {body}", request=resp.request, response=resp
                     )
                 async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:") :].strip()
-                    if data == "[DONE]":
-                        saw_done = True
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
+                    event = self.style.parse(line)
+                    if not event:
                         continue
                     n_chunks += 1
-                    if chunk.get("error"):
-                        # llama-server reports some failures *inside* the SSE
-                        # stream with HTTP 200 already sent. Ignoring these
-                        # chunks -- as any client that only looks at
-                        # choices[].text does -- turns a half-finished
+                    if "_error" in event:
+                        # Some runtimes report failures *inside* the stream,
+                        # after HTTP 200 has already gone out. A client that
+                        # only reads the text field turns a half-finished
                         # generation into a plausible-looking success.
-                        err = chunk["error"]
-                        stream_error = str(err.get("message", err))[:200]
+                        stream_error = event["_error"]
                         break
-                    if chunk.get("usage"):
-                        usage = chunk["usage"]
-                    for choice in chunk.get("choices") or []:
-                        if choice.get("finish_reason"):
-                            finish_reason = choice["finish_reason"]
-                        piece = choice.get("text") or ""
-                        if not piece:
-                            continue
+                    if "_usage" in event:
+                        usage = event["_usage"]
+                    if "_finish" in event:
+                        finish_reason = event["_finish"]
+                    if "_text" in event:
                         if ttft_s is None:
                             # First *non-empty* chunk: some runtimes emit a
                             # priming chunk with an empty string.
                             ttft_s = time.monotonic() - started
-                        text_parts.append(piece)
+                        text_parts.append(event["_text"])
+                    if event.get("_done"):
+                        saw_done = True
+                        break
         except Exception as exc:  # noqa: BLE001 - a failed request is a datum
             return RequestRecord(
                 prompt_tokens=prompt.n_tokens,

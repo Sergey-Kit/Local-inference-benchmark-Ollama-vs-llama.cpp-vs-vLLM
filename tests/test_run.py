@@ -323,3 +323,15 @@ class TestServerEnvironment:
         assert captured["env"] is not None, "Popen was called without env"
         assert captured["env"]["OLLAMA_NUM_PARALLEL"] == "16"
         mgr.log_file.close()
+
+
+class TestOllamaFlashAttention:
+    def test_flash_attention_is_left_unset(self, cfg):
+        """Setting it to "0" costs 5.4x on TTFT and says nothing in the log.
+
+        Measured: TTFT p50 3074 ms with OLLAMA_FLASH_ATTENTION=0 against 570 ms
+        with it unset, everything else identical. Ollama reports
+        FLASH_ATTENTION:false either way, so the variable that changes the
+        result is invisible in the configuration it prints.
+        """
+        assert "OLLAMA_FLASH_ATTENTION" not in cfg["runtimes"]["ollama"]["env"]
