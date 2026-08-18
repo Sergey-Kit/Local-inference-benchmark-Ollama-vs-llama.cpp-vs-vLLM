@@ -178,6 +178,10 @@ class RuntimeClient:
         ttft_s: float | None = None
         text_parts: list[str] = []
         usage: dict | None = None
+        finish_reason: str | None = None
+        n_chunks = 0
+        saw_done = False
+        stream_error: str | None = None
 
         try:
             async with self.client.stream(
@@ -193,14 +197,27 @@ class RuntimeClient:
                         continue
                     data = line[len("data:") :].strip()
                     if data == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    n_chunks += 1
+                    if chunk.get("error"):
+                        # llama-server reports some failures *inside* the SSE
+                        # stream with HTTP 200 already sent. Ignoring these
+                        # chunks -- as any client that only looks at
+                        # choices[].text does -- turns a half-finished
+                        # generation into a plausible-looking success.
+                        err = chunk["error"]
+                        stream_error = str(err.get("message", err))[:200]
+                        break
                     if chunk.get("usage"):
                         usage = chunk["usage"]
                     for choice in chunk.get("choices") or []:
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
                         piece = choice.get("text") or ""
                         if not piece:
                             continue
@@ -217,6 +234,8 @@ class RuntimeClient:
                 total_s=time.monotonic() - started,
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}"[:300],
+                finish_reason=finish_reason,
+                n_chunks=n_chunks,
                 **record_kw,
             )
 
@@ -225,14 +244,28 @@ class RuntimeClient:
         output_tokens, source = self._resolve_output_tokens(usage, completion)
         prompt_tokens = int(usage["prompt_tokens"]) if usage and "prompt_tokens" in usage else prompt.n_tokens
 
+        # A trustworthy request is one that generated tokens AND was seen
+        # through to a proper end. A stream that stops early still yields a
+        # respectable-looking token count and a respectable-looking TTFT; only
+        # the terminator says whether the generation actually finished.
+        failure: str | None = None
+        if stream_error is not None:
+            failure = f"stream error: {stream_error}"
+        elif output_tokens <= 0:
+            failure = "no tokens generated"
+        elif not saw_done and finish_reason is None:
+            failure = f"stream ended after {n_chunks} chunks without finish_reason or [DONE]"
+
         return RequestRecord(
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             ttft_s=ttft_s,
             total_s=total_s,
-            ok=output_tokens > 0,
-            error=None if output_tokens > 0 else "no tokens generated",
+            ok=failure is None,
+            error=failure,
             token_count_source=source,
+            finish_reason=finish_reason,
+            n_chunks=n_chunks,
             **record_kw,
         )
 

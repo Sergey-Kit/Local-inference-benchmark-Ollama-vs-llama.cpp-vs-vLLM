@@ -18,7 +18,23 @@ sampling:
   temperature: 0.0
   top_p: 1.0
   max_tokens: 128
-  ignore_eos: true
+  # OFF, and this was a real finding rather than a default.
+  #
+  # ignore_eos makes every runtime emit exactly max_tokens, which looks like the
+  # fairest possible setup. On this model it is not: forcing Qwen3 to generate
+  # past its natural stop makes it emit control text that llama-server's output
+  # parser rejects, and it kills ~6% of streams mid-generation with
+  #   "The model produced output that does not match the expected Content-only format"
+  # (measured: 2/32 requests; --no-jinja and --reasoning-format none do not help).
+  # Ollama's OpenAI layer does not forward ignore_eos at all, so the setting
+  # could never have been symmetric across the three runtimes anyway.
+  #
+  # Leaving it off makes the request parameters identical everywhere, which is
+  # the project's one rule. TTFT, TPOT and tokens/s are all rates normalised by
+  # token count, so a varying output length does not bias them -- and
+  # output_tokens_p50 is reported per point so that a runtime generating
+  # systematically less is visible rather than hidden.
+  ignore_eos: false
 
 # We measure on /v1/completions, not /v1/chat/completions: the chat template is
 # applied inside each runtime (vLLM reads the HF repo, llama.cpp/Ollama read the

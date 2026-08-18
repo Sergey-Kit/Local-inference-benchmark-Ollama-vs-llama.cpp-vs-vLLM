@@ -33,6 +33,11 @@ class RequestRecord:
     error: str | None = None
     # Populated when the runtime's reported usage disagrees with our tokenizer.
     token_count_source: str = "usage"
+    # Diagnostics: "the runtime stopped early" and "the runtime did not report
+    # usage" produce the same low token count but are completely different
+    # problems, and only finish_reason separates them.
+    finish_reason: str | None = None
+    n_chunks: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -55,6 +60,7 @@ class RunSummary:
     ttft_ms_p50: float | None
     ttft_ms_p95: float | None
     tpot_ms_p50: float | None
+    output_tokens_p50: float | None
     peak_vram_mib: float | None = None
     peak_rss_mib: float | None = None
     cold_start_s: float | None = None
@@ -165,6 +171,10 @@ def summarize_run(
         ttft_ms_p50=percentile(ttfts, 50.0) if ttfts else None,
         ttft_ms_p95=percentile(ttfts, 95.0) if ttfts else None,
         tpot_ms_p50=percentile(tpots, 50.0) if tpots else None,
+        # Without ignore_eos the runtimes choose their own output lengths.
+        # That does not bias the rate metrics, but a runtime that consistently
+        # generates less is doing less work, and that has to be visible.
+        output_tokens_p50=percentile([r.output_tokens for r in ok], 50.0) if ok else None,
         peak_vram_mib=peak_vram_mib,
         peak_rss_mib=peak_rss_mib,
         cold_start_s=cold_start_s,
@@ -206,6 +216,7 @@ def median_across_runs(summaries: Sequence[RunSummary]) -> dict:
         "ttft_ms_p50": med("ttft_ms_p50"),
         "ttft_ms_p95": med("ttft_ms_p95"),
         "tpot_ms_p50": med("tpot_ms_p50"),
+        "output_tokens_p50": med("output_tokens_p50"),
         "peak_vram_mib": med("peak_vram_mib"),
         "peak_rss_mib": med("peak_rss_mib"),
         "cold_start_s": med("cold_start_s"),

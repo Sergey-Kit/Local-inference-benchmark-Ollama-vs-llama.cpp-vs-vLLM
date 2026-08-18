@@ -45,7 +45,7 @@ storage network interface protocol payload header timeout retry backoff
 configuration parameter default override environment container image registry
 """.split()
 
-TASK_INSTRUCTION = "Summarize the following operations report in one short paragraph."
+TASK_INSTRUCTION = "Summarize the operations report above in one short paragraph."
 
 
 def make_document(rng: random.Random, n_words: int) -> str:
@@ -61,7 +61,12 @@ def make_document(rng: random.Random, n_words: int) -> str:
 
 
 def render(tok, document: str) -> str:
-    messages = [{"role": "user", "content": f"{TASK_INSTRUCTION}\n\n{document}"}]
+    # Document first, instruction last. With the instruction leading, every
+    # prompt shared a ~15-token prefix, and llama-server reported evaluating
+    # only 49 of 64 prompt tokens -- it was serving the shared head from its
+    # slot cache, so TTFT was measured with a head start. Unique content first
+    # leaves nothing cacheable beyond the template's opening tag.
+    messages = [{"role": "user", "content": f"{document}\n\n{TASK_INSTRUCTION}"}]
     kwargs = dict(tokenize=False, add_generation_prompt=True)
     try:
         return tok.apply_chat_template(messages, enable_thinking=False, **kwargs)
@@ -78,39 +83,35 @@ def build_prompt(tok, rng: random.Random, target_tokens: int, name: str, prompt_
     """Build a prompt whose rendered length is exactly `target_tokens`.
 
     Word-granularity search cannot hit an exact token count, so the document is
-    instead sliced at token granularity and the slice size is corrected against
-    the *rendered* length. Correcting against the render rather than against the
-    raw document matters: re-tokenizing the assembled string can merge tokens at
-    the seams between template and document, and it is the rendered string that
-    the runtimes actually see.
+    sliced at token granularity and the slice size corrected against the
+    *rendered* length -- correcting against the raw document would miss the
+    tokens that merge at the seams between document and template, and it is the
+    rendered string the runtimes actually see.
+
+    Those seams also mean one extra document token can move the rendered length
+    by two, so the correction can oscillate around the target and never land on
+    it. When that happens the filler is redrawn (deterministically, from the
+    same seeded generator) and the search restarts, which shifts the seam.
     """
-    # Generous pool: ~1.35 tokens per word for this vocabulary, so `target`
-    # words always yields more than `target` tokens to slice from.
-    pool = tok(make_document(rng, target_tokens + 64), add_special_tokens=False).input_ids
-
-    budget = max(1, target_tokens - n_tokens(tok, render(tok, "")))
-    text = render(tok, tok.decode(pool[:budget]))
-    for _ in range(20):
-        count = n_tokens(tok, text)
-        if count == target_tokens:
-            break
-        budget += target_tokens - count
-        budget = max(1, min(budget, len(pool)))
+    for _ in range(12):
+        pool = tok(make_document(rng, target_tokens + 64), add_special_tokens=False).input_ids
+        budget = max(1, target_tokens - n_tokens(tok, render(tok, "")))
+        seen: set[int] = set()
         text = render(tok, tok.decode(pool[:budget]))
+        for _ in range(24):
+            count = n_tokens(tok, text)
+            if count == target_tokens:
+                return {"name": name, "prompt_set": prompt_set, "text": text, "n_tokens": count}
+            if budget in seen:
+                break          # oscillating; redraw the filler and try again
+            seen.add(budget)
+            budget = max(1, min(budget + target_tokens - count, len(pool)))
+            text = render(tok, tok.decode(pool[:budget]))
 
-    count = n_tokens(tok, text)
-    if count != target_tokens:
-        raise SystemExit(
-            f"could not build a {target_tokens}-token prompt for {name} (got {count}); "
-            "prefill comparisons require exact, equal lengths"
-        )
-
-    return {
-        "name": name,
-        "prompt_set": prompt_set,
-        "text": text,
-        "n_tokens": count,
-    }
+    raise SystemExit(
+        f"could not build a {target_tokens}-token prompt for {name}; "
+        "prefill comparisons require exact, equal lengths"
+    )
 
 
 def main() -> int:
@@ -149,10 +150,10 @@ def main() -> int:
 
     # Distinct prefixes are what defeats prefix caching; assert it rather than
     # hope for it.
-    prefixes = {r["text"][:400] for r in rows}
+    prefixes = {r["text"][:64] for r in rows}
     if len(prefixes) != len(rows):
         raise SystemExit("prompts share prefixes; prefix caching would corrupt TTFT")
-    print("verified: all prompts have distinct prefixes")
+    print("verified: all prompts diverge within the first 64 characters")
     return 0
 
 

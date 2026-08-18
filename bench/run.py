@@ -262,6 +262,7 @@ async def run_runtime(
     points: list[Point],
     out_dir: Path,
     raw_writer,
+    on_point=None,
 ) -> list[dict]:
     rt = cfg["runtimes"][runtime]
     sampling = Sampling(**cfg["sampling"])
@@ -339,6 +340,8 @@ async def run_runtime(
                     agg["requests_per_run"] = requests_for(measurement, point.concurrency)
                     agg["vram_baseline_mib"] = baseline
                     aggregates.append(agg)
+                    if on_point is not None:
+                        on_point(agg)
         finally:
             manager.terminate()
             monitor.close()
@@ -353,20 +356,40 @@ async def run_runtime(
 SUMMARY_COLUMNS = [
     "runtime", "scenario", "profile", "prompt_set", "prompt_tokens", "max_tokens",
     "concurrency", "requests_per_run", "n_runs", "n_failed_total", "throughput_tok_s", "ttft_ms_p50",
-    "ttft_ms_p95", "tpot_ms_p50", "peak_vram_mib", "vram_baseline_mib",
+    "ttft_ms_p95", "tpot_ms_p50", "output_tokens_p50", "peak_vram_mib", "vram_baseline_mib",
     "peak_rss_mib", "cold_start_s", "notes",
 ]
 
 
-def write_summary(rows: Iterable[dict], path: Path) -> None:
-    rows = list(rows)
+POINT_KEY = ("runtime", "scenario", "prompt_set", "concurrency")
+
+
+def merge_summary(new_rows: Iterable[dict], path: Path, quiet: bool = False) -> None:
+    """Write summary.csv, replacing rows for the points just measured.
+
+    Merging rather than overwriting matters twice over: the file is rewritten
+    after every measurement point, so a run that is interrupted still leaves
+    usable aggregates behind; and runtimes can be benchmarked in separate
+    invocations -- which they have to be, since only one may hold the GPU --
+    without the later run erasing the earlier one's results.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows: dict[tuple, dict] = {}
+    if path.exists():
+        with path.open(newline="") as fh:
+            for row in csv.DictReader(fh):
+                rows[tuple(str(row.get(k, "")) for k in POINT_KEY)] = row
+    for row in new_rows:
+        rows[tuple(str(row.get(k, "")) for k in POINT_KEY)] = row
+
+    ordered = sorted(rows.values(), key=lambda r: (str(r.get("runtime")), str(r.get("scenario")),
+                                                   str(r.get("prompt_set")), int(float(r.get("concurrency") or 0))))
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=SUMMARY_COLUMNS, extrasaction="ignore")
         writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    print(f"\nwrote {len(rows)} rows to {path}")
+        writer.writerows(ordered)
+    if not quiet:
+        print(f"\nsummary.csv now holds {len(ordered)} measurement points -> {path}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -402,19 +425,29 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / "raw").mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+    summary_path = out_dir / "summary.csv"
     all_aggregates: list[dict] = []
+
+    def on_point(agg: dict) -> None:
+        # Flush after every point: this machine is slow enough that a full
+        # matrix outlives most patience, and a partial result that survives is
+        # worth more than a complete one that does not.
+        merge_summary([agg], summary_path, quiet=True)
+
     for runtime in runtimes:
         raw_path = out_dir / "raw" / f"{runtime}_{stamp}.jsonl"
         print(f"\n=== {runtime} === (raw -> {raw_path})")
         with raw_path.open("w") as raw_fh:
             def raw_writer(row: dict, _fh=raw_fh) -> None:
                 _fh.write(json.dumps(row) + "\n")
+                _fh.flush()
 
             all_aggregates.extend(
-                asyncio.run(run_runtime(cfg, runtime, prompt_sets, points, out_dir, raw_writer))
+                asyncio.run(run_runtime(cfg, runtime, prompt_sets, points, out_dir,
+                                        raw_writer, on_point=on_point))
             )
 
-    write_summary(all_aggregates, out_dir / "summary.csv")
+    merge_summary([], summary_path)
     return 0
 
 
