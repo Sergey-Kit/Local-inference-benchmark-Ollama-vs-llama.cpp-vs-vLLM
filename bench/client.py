@@ -80,7 +80,15 @@ class RuntimeClient:
 
     async def __aenter__(self) -> "RuntimeClient":
         limits = httpx.Limits(max_connections=64, max_keepalive_connections=64)
-        self._client = httpx.AsyncClient(timeout=self.timeout_s, limits=limits)
+        # trust_env=False: httpx honours HTTP_PROXY/HTTPS_PROXY by default, and
+        # this machine has http_proxy=http://127.0.0.1:12334 set with no
+        # no_proxy. Requests to the runtime on 127.0.0.1 would be routed through
+        # that proxy, which answers 502 -- so every measurement would fail, or
+        # worse, succeed while timing the proxy hop. The server is always local;
+        # it must never be reached through a proxy.
+        self._client = httpx.AsyncClient(
+            timeout=self.timeout_s, limits=limits, trust_env=False
+        )
         return self
 
     async def __aexit__(self, *exc) -> None:

@@ -164,3 +164,28 @@ class TestRequestCount:
     def test_never_below_the_floor(self, cfg):
         from bench.run import requests_for
         assert requests_for(cfg["measurement"], 1) == 16
+
+
+class TestNoProxy:
+    def test_client_ignores_proxy_environment(self, monkeypatch):
+        """The runtime is always on localhost and must never be proxied.
+
+        This box sets http_proxy=http://127.0.0.1:12334 with no no_proxy, and
+        httpx honours those variables by default -- which turns every request
+        to the runtime into a 502 from the proxy.
+        """
+        import asyncio
+
+        from bench.client import RuntimeClient
+
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:12334")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:12334")
+        monkeypatch.delenv("no_proxy", raising=False)
+
+        async def check():
+            async with RuntimeClient("t", "http://127.0.0.1:8080/v1", "m") as c:
+                assert c.client.trust_env is False
+                transport = c.client._mounts
+                assert not transport, f"proxy mounts configured: {transport}"
+
+        asyncio.run(check())

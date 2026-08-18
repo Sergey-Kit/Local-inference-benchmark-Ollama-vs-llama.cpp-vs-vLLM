@@ -32,9 +32,13 @@ echo "==> 1/3 safetensors: ${HF_ID} -> ${LOCAL_DIR}"
 "${ROOT}/.venv/bin/hf" download "${HF_ID}" --local-dir "${LOCAL_DIR}"
 
 echo "==> 2/3 GGUF F16: ${LOCAL_DIR} -> ${GGUF}"
-[ -d vendor/llama.cpp ] || { echo "run scripts/build_llamacpp.sh first"; exit 1; }
-"${PY}" -m pip install -q -r vendor/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
-"${PY}" vendor/llama.cpp/convert_hf_to_gguf.py "${LOCAL_DIR}" \
+[ -d vendor/llama.cpp ] || { echo "clone llama.cpp first (scripts/build_llamacpp.sh)"; exit 1; }
+# Its own venv: the converter needs torch, and the measurement venv is kept
+# light on purpose so it stays liftable into P2/P5.
+[ -d .venv-convert ] || python3 -m venv .venv-convert
+.venv-convert/bin/python -m pip install -q --upgrade pip
+.venv-convert/bin/python -m pip install -q -r vendor/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+.venv-convert/bin/python vendor/llama.cpp/convert_hf_to_gguf.py "${LOCAL_DIR}" \
     --outtype f16 --outfile "${GGUF}"
 
 echo "==> 3/3 Ollama import: ${GGUF} -> ${OLLAMA_TAG}"
