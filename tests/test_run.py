@@ -253,13 +253,20 @@ class TestOllamaModelStore:
         which silently substitutes Ollama's own Q4_K_M for the F16 weights the
         other two runtimes are using.
         """
-        env = cfg["runtimes"]["ollama"]["env"]
-        assert env["OLLAMA_MODELS"] == "vendor/ollama/models"
+        from bench.run import REPO_ROOT, substitution_vars, _fmt
+        raw = cfg["runtimes"]["ollama"]["env"]["OLLAMA_MODELS"]
+        resolved = _fmt(raw, substitution_vars(cfg, cfg["server_profiles"]["interactive"]))
+        # Absolute: Ollama does not honour a relative store path, and the
+        # failure mode is a server that starts fine and then 404s on the model.
+        assert resolved.startswith("/")
+        assert resolved == f"{REPO_ROOT}/vendor/ollama/models"
 
     def test_the_tag_exists_in_that_store(self, cfg):
         import json
         from pathlib import Path
-        store = Path(cfg["runtimes"]["ollama"]["env"]["OLLAMA_MODELS"])
+        from bench.run import substitution_vars, _fmt
+        store = Path(_fmt(cfg["runtimes"]["ollama"]["env"]["OLLAMA_MODELS"],
+                          substitution_vars(cfg, cfg["server_profiles"]["interactive"])))
         if not store.exists():
             pytest.skip("ollama store not populated yet")
         tag = cfg["model"]["ollama_tag"]
@@ -270,3 +277,49 @@ class TestOllamaModelStore:
         layers = [l for l in manifest["layers"]
                   if l["mediaType"] == "application/vnd.ollama.image.model"]
         assert len(layers) == 1
+
+
+class TestServerEnvironment:
+    def test_env_block_is_substituted_and_complete(self, cfg):
+        """The `env:` block must survive substitution intact.
+
+        It was for a while built and then dropped on the floor -- never passed
+        to Popen -- so Ollama would have been measured at its default
+        parallelism and context instead of the configured 16 and 512. That is
+        invisible in the output: the server starts, answers every request, and
+        reports numbers for a different experiment.
+        """
+        from pathlib import Path
+
+        from bench.run import ServerManager
+
+        mgr = ServerManager(cfg, "ollama", Path("."))
+        env = mgr.env_overrides(cfg["server_profiles"]["interactive"])
+        assert env["OLLAMA_NUM_PARALLEL"] == "16"
+        assert env["OLLAMA_CONTEXT_LENGTH"] == "512"
+        assert env["OLLAMA_MODELS"].startswith("/")
+        assert "{" not in "".join(env.values()), "unsubstituted placeholder left in env"
+
+    def test_launch_passes_env_to_the_subprocess(self, cfg, monkeypatch):
+        from pathlib import Path
+
+        import bench.run as run_mod
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                captured["cmd"] = cmd
+                captured["env"] = kw.get("env")
+                self.pid = 1
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(run_mod.subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(run_mod, "port_is_open", lambda *a, **k: False)
+        mgr = run_mod.ServerManager(cfg, "ollama", Path("/tmp"))
+        mgr.launch("interactive", cfg["server_profiles"]["interactive"])
+        assert captured["env"] is not None, "Popen was called without env"
+        assert captured["env"]["OLLAMA_NUM_PARALLEL"] == "16"
+        mgr.log_file.close()

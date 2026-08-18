@@ -130,6 +130,14 @@ class RuntimeClient:
                 if resp.status_code == 200:
                     return time.monotonic() - started
                 last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                # A missing model is a misconfiguration, not a slow load. Left
+                # to retry it burns the whole timeout -- 15 minutes -- before
+                # reporting something that was already true on the first try.
+                if resp.status_code == 404 and "not found" in resp.text.lower():
+                    raise SystemExit(
+                        f"{self.name} is up but does not have model "
+                        f"'{self.served_model}': {resp.text[:200]}"
+                    )
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             await asyncio.sleep(poll_s)

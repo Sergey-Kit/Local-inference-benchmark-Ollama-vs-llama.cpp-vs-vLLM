@@ -63,10 +63,17 @@ def load_prompts(path: str | Path) -> dict[str, list[Prompt]]:
     return sets
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
 def substitution_vars(cfg: dict, profile: dict) -> dict[str, Any]:
     model = cfg["model"]
     return {
         **model,
+        # Some runtimes will not accept a relative path in their environment --
+        # Ollama silently starts against an empty store and then 404s on the
+        # model -- so the config can ask for an absolute one explicitly.
+        "repo_root": str(REPO_ROOT),
         "parallel": profile["parallel"],
         "ctx_per_slot": profile["ctx_per_slot"],
         # llama-server's -c is the TOTAL context shared by all slots; passing
@@ -110,6 +117,17 @@ class ServerManager:
         self.proc: subprocess.Popen | None = None
         self.log_file = None
 
+    def env_overrides(self, profile: dict) -> dict[str, str]:
+        """The runtime's `env:` block, substituted.
+
+        Split out and echoed into the server log because it is otherwise
+        invisible: these variables carry the parallelism and context settings
+        that make the comparison fair, and a server started without them comes
+        up perfectly happily on its own defaults.
+        """
+        vars_ = substitution_vars(self.cfg, profile)
+        return {k: _fmt(v, vars_) for k, v in (self.rt.get("env") or {}).items()}
+
     def launch(self, profile_name: str, profile: dict) -> subprocess.Popen:
         if self.proc is not None:
             raise RuntimeError("a server is already running under this manager")
@@ -123,19 +141,23 @@ class ServerManager:
 
         vars_ = substitution_vars(self.cfg, profile)
         cmd = [_fmt(part, vars_) for part in self.rt["command"]]
-        env = dict(os.environ)
-        for key, value in (self.rt.get("env") or {}).items():
-            env[key] = _fmt(value, vars_)
+        overrides = self.env_overrides(profile)
+        env = {**os.environ, **overrides}
 
         log_path = self.log_dir / f"{self.runtime}_{profile_name}.log"
         self.log_file = log_path.open("w")
         self.log_file.write(f"# {' '.join(cmd)}\n")
+        for key, value in sorted(overrides.items()):
+            self.log_file.write(f"# {key}={value}\n")
         self.log_file.flush()
         print(f"    launching: {' '.join(cmd)}")
+        if overrides:
+            print(f"      env: {' '.join(f'{k}={v}' for k, v in sorted(overrides.items()))}")
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
+            env=env,
             start_new_session=True,  # own process group, so children die too
         )
         self._log_path = log_path

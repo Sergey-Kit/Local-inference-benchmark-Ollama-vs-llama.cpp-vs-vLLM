@@ -156,7 +156,7 @@ runtimes:
       # In-tree model store. Without this Ollama reads ~/.ollama and would not
       # find the F16 import at all -- and `ollama pull`-ing a replacement is
       # exactly the substitution this project exists to avoid.
-      OLLAMA_MODELS: "vendor/ollama/models"
+      OLLAMA_MODELS: "{repo_root}/vendor/ollama/models"
       OLLAMA_NUM_PARALLEL: "{parallel}"
       OLLAMA_CONTEXT_LENGTH: "{ctx_per_slot}"
       OLLAMA_KEEP_ALIVE: "24h"       # otherwise the model unloads between runs
@@ -191,5 +191,7 @@ runtimes:
       # explicitly too: a cache hit would report a spectacular and
       # completely fake TTFT.
       - "--no-enable-prefix-caching"
-    env:
-      VLLM_ATTENTION_BACKEND: "XFORMERS"   # FlashAttention-2 requires sm80
+    # No VLLM_ATTENTION_BACKEND override. FlashAttention-2 needs sm80, so this
+    # card cannot use it -- but vLLM 0.27 ships no xformers, and naming a
+    # backend that is not installed fails the launch outright. Let vLLM select,
+    # and see runtimes/vllm.md for the ladder to walk if it cannot.
