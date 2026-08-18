@@ -1,0 +1,18 @@
+# Benchmark harness only -- deliberately light, so it installs on the
+# measurement machine without pulling a CUDA torch build.
+# vLLM lives in a separate venv, see requirements-vllm.txt.
+#
+#   python3 -m venv .venv && .venv/bin/python -m pip install -U pip
+#   .venv/bin/python -m pip install -r requirements.txt
+#
+# Versions are the ones the reported results were produced with.
+httpx==0.28.1
+PyYAML==6.0.3
+nvidia-ml-py==13.610.43
+psutil==7.2.2
+# Cross-runtime source of truth for tokenization. Qwen3 needs >=4.51.
+transformers==5.15.0
+huggingface-hub==1.28.0
+pandas==2.3.3
+matplotlib==3.10.9
+pytest==9.1.1

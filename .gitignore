@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-vllm/
+*.egg-info/
+.pytest_cache/
+
+# Models and third-party sources (huge, fetched by scripts/)
+models/
+vendor/
+Modelfile
+
+# Results: keep the directory structure and the committed summary,
+# but not every raw run from local experimentation.
+results/raw/*.jsonl
+!results/raw/.gitkeep
+
+# Environment
+.env

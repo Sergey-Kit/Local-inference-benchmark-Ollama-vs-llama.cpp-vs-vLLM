@@ -1,0 +1,4 @@
+# Installed into a SEPARATE venv (.venv-vllm): vLLM pins its own torch build
+# (~10 GB) and would clobber the harness venv.
+#   python3 -m venv .venv-vllm && .venv-vllm/bin/pip install -r requirements-vllm.txt
+vllm==0.10.1.1

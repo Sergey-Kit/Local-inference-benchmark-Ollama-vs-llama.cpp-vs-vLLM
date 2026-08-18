@@ -1,0 +1,132 @@
+# P1 inference benchmark -- single source of truth for the whole experiment.
+# Nothing about the model or the runtimes is hardcoded in bench/*.py; this file
+# is meant to travel to P2/P5 with only the `model` and `runtimes` blocks changed.
+
+model:
+  hf_id: Qwen/Qwen3-0.6B
+  local_dir: models/Qwen3-0.6B          # safetensors, consumed by vLLM
+  gguf: models/Qwen3-0.6B-f16.gguf      # converted from the SAME safetensors
+  ollama_tag: qwen3-06b-f16             # imported from the SAME gguf via Modelfile
+  # Forced everywhere: Qwen3 ships bfloat16, which Turing (sm75) has no hardware
+  # support for. FP16 is the one dtype all three runtimes can agree on here.
+  dtype: float16
+
+# Identical on every runtime. temperature=0 makes runs comparable; ignore_eos
+# makes every runtime emit exactly max_tokens, so TPOT and throughput are not
+# contaminated by runtimes deciding to stop at different lengths.
+sampling:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 128
+  ignore_eos: true
+
+# We measure on /v1/completions, not /v1/chat/completions: the chat template is
+# applied inside each runtime (vLLM reads the HF repo, llama.cpp/Ollama read the
+# one baked into the GGUF) and any divergence silently changes the prompt token
+# count, which would invalidate every prefill/TTFT comparison. The template is
+# applied once, in the client, by prompts/build_prompts.py.
+endpoint: /completions
+
+# KV cache for this model costs 112 KiB/token (2 * 28 layers * 8 kv_heads *
+# 128 head_dim * 2 bytes). With ~3.5 GB of usable VRAM the concurrency sweep and
+# the long-prompt test cannot share one server configuration, so each gets its
+# own profile and its own server launch.
+server_profiles:
+  interactive:            # short prompts, many slots
+    parallel: 16
+    ctx_per_slot: 512     # 16 * 512 = 8192 tokens ~= 896 MiB KV
+  longctx:                # one slot, room for a ~2.5k-token prompt
+    parallel: 1
+    ctx_per_slot: 4096    # 4096 tokens ~= 448 MiB KV
+
+scenarios:
+  - name: concurrency_sweep
+    profile: interactive
+    prompt_set: short
+    concurrency: [1, 4, 8, 16]
+  - name: prompt_length
+    profile: longctx
+    prompt_set: [short, long]
+    concurrency: [1]
+
+measurement:
+  warmup_requests: 8      # discarded, per SPEC section 2
+  n_runs: 3               # >= 3, median is reported
+  requests_per_run: 16    # requests issued per run at each concurrency level
+  request_timeout_s: 600
+
+monitor:
+  poll_interval_s: 0.1
+  # WSL2 does not expose per-process GPU memory (nvidia-smi
+  # --query-compute-apps returns an empty table), so peak VRAM is measured as
+  # device-wide `used` minus a baseline sampled before the server starts.
+  baseline_settle_s: 2.0
+
+runtimes:
+  llamacpp:
+    base_url: http://127.0.0.1:8080/v1
+    served_model: "{gguf}"
+    port: 8080
+    health_path: /health
+    # -c is the TOTAL context shared by all slots and is divided by --parallel.
+    # Passing ctx_per_slot here instead of parallel*ctx_per_slot would silently
+    # give each slot ctx/16 and break the long-prompt scenario.
+    command:
+      - vendor/llama.cpp/build/bin/llama-server
+      - "-m"
+      - "{gguf}"
+      - "-ngl"
+      - "99"
+      - "--parallel"
+      - "{parallel}"
+      - "-c"
+      - "{ctx_total}"
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "-t"
+      - "4"
+      - "--no-warmup"
+
+  ollama:
+    base_url: http://127.0.0.1:11434/v1
+    served_model: "{ollama_tag}"
+    port: 11434
+    health_path: /
+    command:
+      - ollama
+      - serve
+    env:
+      OLLAMA_NUM_PARALLEL: "{parallel}"
+      OLLAMA_CONTEXT_LENGTH: "{ctx_per_slot}"
+      OLLAMA_KEEP_ALIVE: "24h"       # otherwise the model unloads between runs
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "0"    # sm75 has no FA2; keep it off explicitly
+    # Ollama's OpenAI layer does not forward ignore_eos. Recorded as a known
+    # deviation; the client falls back to counting tokens actually returned.
+    supports_ignore_eos: false
+
+  vllm:
+    base_url: http://127.0.0.1:8000/v1
+    served_model: "{local_dir}"
+    port: 8000
+    health_path: /health
+    command:
+      - .venv-vllm/bin/vllm
+      - serve
+      - "{local_dir}"
+      - "--dtype"
+      - "float16"          # no bfloat16 on sm75
+      - "--enforce-eager"  # CUDA graph capture costs VRAM we do not have
+      - "--max-model-len"
+      - "{ctx_per_slot}"
+      - "--max-num-seqs"
+      - "{parallel}"
+      - "--gpu-memory-utilization"
+      - "0.80"             # the desktop already holds ~13% of the card
+      - "--port"
+      - "8000"
+      - "--disable-log-requests"
+    env:
+      VLLM_ATTENTION_BACKEND: "XFORMERS"   # FlashAttention-2 requires sm80
