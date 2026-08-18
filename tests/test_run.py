@@ -213,3 +213,31 @@ class TestRestartPolicy:
         # Short prompts leak far less, and a cold start per run would dominate
         # the concurrency sweep's wall clock for no gain in fidelity.
         assert not cfg["server_profiles"]["interactive"].get("restart_between_runs", False)
+
+
+class TestOllamaModelStore:
+    def test_points_at_the_in_tree_store(self, cfg):
+        """Ollama must read the F16 import, not ~/.ollama.
+
+        Without OLLAMA_MODELS the server starts happily against the default
+        store, fails to find the tag, and the obvious "fix" is `ollama pull` --
+        which silently substitutes Ollama's own Q4_K_M for the F16 weights the
+        other two runtimes are using.
+        """
+        env = cfg["runtimes"]["ollama"]["env"]
+        assert env["OLLAMA_MODELS"] == "vendor/ollama/models"
+
+    def test_the_tag_exists_in_that_store(self, cfg):
+        import json
+        from pathlib import Path
+        store = Path(cfg["runtimes"]["ollama"]["env"]["OLLAMA_MODELS"])
+        if not store.exists():
+            pytest.skip("ollama store not populated yet")
+        tag = cfg["model"]["ollama_tag"]
+        name, _, version = tag.partition(":")
+        found = list((store / "manifests").rglob(f"{name}/{version or 'latest'}"))
+        assert found, f"{tag} not imported into {store}"
+        manifest = json.loads(found[0].read_text())
+        layers = [l for l in manifest["layers"]
+                  if l["mediaType"] == "application/vnd.ollama.image.model"]
+        assert len(layers) == 1
