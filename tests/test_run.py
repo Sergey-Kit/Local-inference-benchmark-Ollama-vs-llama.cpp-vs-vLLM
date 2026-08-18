@@ -96,8 +96,11 @@ class TestConfigInvariants:
 class TestMatrix:
     def test_expands_to_the_documented_matrix(self, cfg):
         points = expand_scenarios(cfg)
-        assert Point("concurrency_sweep", "interactive", "short", 16) in points
-        assert Point("prompt_length", "longctx", "long", 1) in points
+        # Compare on what identifies a point, not on the whole dataclass: the
+        # per-scenario tuning that rides along is not part of its identity.
+        ids = {(p.scenario, p.profile, p.prompt_set, p.concurrency) for p in points}
+        assert ("concurrency_sweep", "interactive", "short", 16) in ids
+        assert ("prompt_length", "longctx", "long", 1) in ids
         assert len(points) == 6
 
     def test_enough_prompts_for_every_run_plus_warmup(self, cfg):
@@ -119,7 +122,9 @@ class TestMatrix:
         for scenario in cfg["scenarios"]:
             names = scenario["prompt_set"]
             names = [names] if isinstance(names, str) else names
-            needed = max(requests_for(m, c) for c in scenario["concurrency"]) * int(m["n_runs"])
+            floor = {"requests_per_run_min": scenario["requests_per_run_min"]} \
+                if "requests_per_run_min" in scenario else {}
+            needed = max(requests_for(m, c, floor) for c in scenario["concurrency"]) * int(m["n_runs"])
             for name in names:
                 assert len(sets[name]) >= needed + warmup, (
                     f"{name}: {len(sets[name])} prompts, need {needed + warmup}"
@@ -160,6 +165,20 @@ class TestPrompts:
 
 
 class TestRequestCount:
+    def test_scenario_may_lower_the_floor(self, cfg):
+        """The long-prompt scenario opts out of the sweep's request budget.
+
+        A 2560-token prefill costs ~6 s here against <1 s of generation, so the
+        sweep's 16 requests would dominate the whole matrix's wall clock to
+        measure a low-variance single-stream number.
+        """
+        from bench.run import requests_for
+        m = cfg["measurement"]
+        long_scenario = next(s for s in cfg["scenarios"] if s["name"] == "prompt_length")
+        floor = {"requests_per_run_min": long_scenario["requests_per_run_min"]}
+        assert requests_for(m, 1, floor) < requests_for(m, 1)
+        assert requests_for(m, 1, floor) * int(m["n_runs"]) >= 20  # still enough samples
+
     def test_scales_with_concurrency(self, cfg):
         from bench.run import requests_for
         m = cfg["measurement"]

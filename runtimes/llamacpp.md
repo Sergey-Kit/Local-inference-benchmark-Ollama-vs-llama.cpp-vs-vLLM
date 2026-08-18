@@ -73,5 +73,45 @@ during decode.
 
 ## Endpoint
 
-`http://127.0.0.1:8080/v1/completions` — supports `stream_options.include_usage`
-and `ignore_eos`.
+`http://127.0.0.1:8080/v1/completions`, with
+`stream_options: {"include_usage": true}` so a streamed response carries a usage
+block at all.
+
+## Two behaviours worth knowing before you trust a number
+
+**Errors arrive inside the stream.** Once `llama-server` has sent HTTP 200 it
+reports some failures as an SSE chunk:
+
+```json
+{"error":{"code":500,"message":"The model produced output that does not match the expected Content-only format","type":"server_error"}}
+```
+
+A client that only reads `choices[].text` sees a generation that stopped early
+and no error at all — a plausible token count with a plausible TTFT. `ignore_eos`
+triggers this reliably on Qwen3 (2 of 32 requests): forced past its natural stop,
+the model emits control text the output parser rejects. Neither `--no-jinja` nor
+`--reasoning-format none` prevents it. This benchmark runs without `ignore_eos`
+and treats any stream that ends without a terminator as a failed measurement.
+
+**It leaks host RAM per request.** Measured on this build (`af51726`), with the
+model fully offloaded to the GPU:
+
+| prompt | RSS growth per request |
+|---|---|
+| 64 tokens | ~78 MiB |
+| 2560 tokens | ~295 MiB |
+
+Roughly 70 MiB fixed plus ~70 KiB per prompt token, climbing linearly and never
+returned. On a 5.5 GB box that is about sixteen long-prompt requests before the
+kernel OOM-kills the server mid-measurement:
+
+```
+Out of memory: Killed process llama-server, anon-rss:4871812kB
+```
+
+Note that this is **host** RAM, not VRAM — VRAM peaked at 2.3 GB of the ~3.5 GB
+available. Ruled out as causes: CUDA graph caching
+(`GGML_CUDA_DISABLE_GRAPHS=1`), glibc arena fragmentation (`MALLOC_ARENA_MAX`),
+and compute-buffer sizing (`-b`/`-ub`) — none change the slope. It also explains
+throughput sagging run over run at concurrency 8 (120 → 92 → 72 tok/s): the box
+was going to swap. The `longctx` profile therefore takes a fresh server per run.

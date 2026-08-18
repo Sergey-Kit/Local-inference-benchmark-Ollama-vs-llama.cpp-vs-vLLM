@@ -74,9 +74,20 @@ scenarios:
     profile: longctx
     prompt_set: [short, long]
     concurrency: [1]
+    # Fewer requests than the sweep. A 2560-token prefill costs ~6 s on this
+    # GPU against <1 s of generation, so each request here is ~8x the cost of a
+    # short one -- while the quantity being measured, single-stream TTFT, is
+    # both low-variance and measured once per request. 8 x 3 runs = 24 samples.
+    requests_per_run_min: 8
 
 measurement:
-  warmup_requests: 8      # discarded, per SPEC section 2
+  # Discarded, per SPEC section 2. Four, not eight: warm-up exists to get past
+  # first-call CUDA kernel setup and buffer allocation, which a couple of
+  # requests already do. It is paid once per server launch, so on a profile
+  # that takes a fresh server per run it is paid per run -- at 2560-token
+  # prompts, eight warm-up requests cost ~64 s each time, which was half the
+  # wall clock of the long-prompt scenario.
+  warmup_requests: 4
   n_runs: 3               # >= 3, median is reported
   request_timeout_s: 600
   # Requests per run = max(min, factor * concurrency). Issuing only

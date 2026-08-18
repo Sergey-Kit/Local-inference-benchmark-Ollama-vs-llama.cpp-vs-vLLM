@@ -191,6 +191,13 @@ class Point:
     profile: str
     prompt_set: str
     concurrency: int
+    requests_per_run_min: int | None = None
+
+    def request_floor(self) -> dict:
+        """The scenario-level overrides `requests_for` understands."""
+        return {} if self.requests_per_run_min is None else {
+            "requests_per_run_min": self.requests_per_run_min
+        }
 
 
 def expand_scenarios(cfg: dict) -> list[Point]:
@@ -200,16 +207,22 @@ def expand_scenarios(cfg: dict) -> list[Point]:
         sets = [sets] if isinstance(sets, str) else sets
         for prompt_set in sets:
             for conc in scenario["concurrency"]:
-                points.append(Point(scenario["name"], scenario["profile"], prompt_set, conc))
+                points.append(Point(scenario["name"], scenario["profile"], prompt_set, conc,
+                                    scenario.get("requests_per_run_min")))
     return points
 
 
-def requests_for(measurement: dict, concurrency: int) -> int:
-    """Enough requests that the server reaches steady state at this concurrency."""
-    return max(
-        int(measurement["requests_per_run_min"]),
-        int(measurement["requests_per_run_factor"]) * concurrency,
-    )
+def requests_for(measurement: dict, concurrency: int, scenario: dict | None = None) -> int:
+    """Enough requests that the server reaches steady state at this concurrency.
+
+    A scenario may lower the floor: the long-prompt point pays ~8x per request
+    for a low-variance, single-stream measurement, so spending the sweep's
+    request budget there buys precision nobody needs at a cost that dominates
+    the whole matrix.
+    """
+    floor = int((scenario or {}).get("requests_per_run_min",
+                                     measurement["requests_per_run_min"]))
+    return max(floor, int(measurement["requests_per_run_factor"]) * concurrency)
 
 
 @dataclass
@@ -268,7 +281,7 @@ async def server_session(cfg, runtime, profile_name, profile, count_tokens, out_
 async def warm_up(session: Session, prompts, sampling, measurement, profile_points) -> None:
     """Discarded traffic, drawn from past every window the measured runs use."""
     reserve = max(
-        requests_for(measurement, p.concurrency) * int(measurement["n_runs"])
+        requests_for(measurement, p.concurrency, p.request_floor()) * int(measurement["n_runs"])
         for p in profile_points
     )
     await session.client.warmup(
@@ -285,7 +298,7 @@ async def one_run(
     run_index: int,
     cold_start_s: float | None,
 ) -> RunSummary:
-    n_requests = requests_for(measurement, point.concurrency)
+    n_requests = requests_for(measurement, point.concurrency, point.request_floor())
     session.monitor.start()
     records, wall = await session.client.run_batch(
         prompts,
@@ -353,7 +366,7 @@ async def run_runtime(
         agg["profile"] = profile_name
         agg["prompt_tokens"] = prompt_sets[point.prompt_set][0].n_tokens
         agg["max_tokens"] = sampling.max_tokens
-        agg["requests_per_run"] = requests_for(measurement, point.concurrency)
+        agg["requests_per_run"] = requests_for(measurement, point.concurrency, point.request_floor())
         agg["vram_baseline_mib"] = baseline
         aggregates.append(agg)
         if on_point is not None:
@@ -377,7 +390,7 @@ async def run_runtime(
             # box -- and a run that dies mid-measurement is worse than a slow one.
             for point in profile_points:
                 print(f"    {point.scenario} / {point.prompt_set} / concurrency "
-                      f"{point.concurrency} ({requests_for(measurement, point.concurrency)} requests/run)")
+                      f"{point.concurrency} ({requests_for(measurement, point.concurrency, point.request_floor())} requests/run)")
                 summaries, baseline = [], None
                 for run_index in range(n_runs):
                     async with server_session(cfg, runtime, profile_name, profile,
@@ -398,7 +411,7 @@ async def run_runtime(
                               sampling, measurement, profile_points)
                 for point in profile_points:
                     print(f"    {point.scenario} / {point.prompt_set} / concurrency "
-                          f"{point.concurrency} ({requests_for(measurement, point.concurrency)} requests/run)")
+                          f"{point.concurrency} ({requests_for(measurement, point.concurrency, point.request_floor())} requests/run)")
                     summaries = [
                         await one_run(session, point, prompt_sets[point.prompt_set], sampling,
                                       measurement, i,
@@ -478,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
             for point in points:
                 print(f"  {point.scenario:20s} profile={point.profile:12s} "
                       f"{point.prompt_set:6s} concurrency={point.concurrency:2d} "
-                      f"requests/run={requests_for(cfg['measurement'], point.concurrency)}")
+                      f"requests/run={requests_for(cfg['measurement'], point.concurrency, point.request_floor())}")
         return 0
 
     prompt_sets = load_prompts(args.prompts)
