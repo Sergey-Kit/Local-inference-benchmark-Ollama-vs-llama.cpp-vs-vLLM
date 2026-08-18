@@ -63,6 +63,7 @@ class RunSummary:
     ttft_ms_p95: float | None
     tpot_ms_p50: float | None
     output_tokens_p50: float | None
+    token_drift_max: float | None = None
     peak_vram_mib: float | None = None
     peak_rss_mib: float | None = None
     cold_start_s: float | None = None
@@ -158,9 +159,7 @@ def summarize_run(
     sources = {r.token_count_source for r in ok}
     if sources - {"usage"}:
         notes.append(f"token counts from {sorted(sources)}")
-    drifts = [r.token_drift for r in ok if r.token_drift]
-    if drifts:
-        notes.append(f"tokenizer drift up to {max(drifts):.1%}")
+
 
     return RunSummary(
         runtime=head.runtime,
@@ -180,6 +179,7 @@ def summarize_run(
         # That does not bias the rate metrics, but a runtime that consistently
         # generates less is doing less work, and that has to be visible.
         output_tokens_p50=percentile([r.output_tokens for r in ok], 50.0) if ok else None,
+        token_drift_max=max((r.token_drift for r in ok if r.token_drift), default=None),
         peak_vram_mib=peak_vram_mib,
         peak_rss_mib=peak_rss_mib,
         cold_start_s=cold_start_s,
@@ -222,6 +222,11 @@ def median_across_runs(summaries: Sequence[RunSummary]) -> dict:
         "ttft_ms_p95": med("ttft_ms_p95"),
         "tpot_ms_p50": med("tpot_ms_p50"),
         "output_tokens_p50": med("output_tokens_p50"),
+        # Worst disagreement between the runtime's usage and our tokenizer,
+        # across every run of this point. A percent or two is the expected cost
+        # of the detokenise/retokenise round trip.
+        "token_drift_max": max((s.token_drift_max for s in summaries
+                                if s.token_drift_max is not None), default=None),
         "peak_vram_mib": med("peak_vram_mib"),
         "peak_rss_mib": med("peak_rss_mib"),
         "cold_start_s": med("cold_start_s"),

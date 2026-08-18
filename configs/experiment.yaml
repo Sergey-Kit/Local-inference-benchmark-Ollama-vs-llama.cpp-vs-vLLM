@@ -47,14 +47,23 @@ endpoint: /completions
 # 128 head_dim * 2 bytes). With ~3.5 GB of usable VRAM the concurrency sweep and
 # the long-prompt test cannot share one server configuration, so each gets its
 # own profile and its own server launch.
+# Every profile takes a fresh server per run, so the three runs of a point are
+# independent replicates rather than successive states of one process. This is
+# not tidiness. Reusing a server, llama.cpp's throughput fell monotonically run
+# over run in lockstep with its RSS -- 216 -> 166 -> 144 tok/s at concurrency 16
+# while RSS climbed 2709 -> 3023 -> 3923 MiB -- so the median of three runs was
+# reporting a degrading system, and which number you got depended on run order.
+# The degradation is itself a finding and is written up in runtimes/llamacpp.md;
+# it must not be allowed to leak into the cross-runtime comparison.
 server_profiles:
   interactive:            # short prompts, many slots
     parallel: 16
     ctx_per_slot: 512     # 16 * 512 = 8192 tokens ~= 896 MiB KV
+    restart_between_runs: true
   longctx:                # one slot, room for a ~2.5k-token prompt
     parallel: 1
     ctx_per_slot: 4096    # 4096 tokens ~= 448 MiB KV
-    # A fresh server for every run. llama-server leaks host RAM per request on
+    # A fresh server for every run, as above. llama-server leaks host RAM per request on
     # this build -- roughly 70 MiB fixed plus 70 KiB per prompt token, so about
     # 295 MiB for a 2560-token prompt -- and 5.5 GB of RAM buys about sixteen
     # of those before the kernel OOM-kills it mid-measurement. (Confirmed by

@@ -430,7 +430,7 @@ async def run_runtime(
 SUMMARY_COLUMNS = [
     "runtime", "scenario", "profile", "prompt_set", "prompt_tokens", "max_tokens",
     "concurrency", "requests_per_run", "n_runs", "n_failed_total", "throughput_tok_s", "ttft_ms_p50",
-    "ttft_ms_p95", "tpot_ms_p50", "output_tokens_p50", "peak_vram_mib", "vram_baseline_mib",
+    "ttft_ms_p95", "tpot_ms_p50", "output_tokens_p50", "token_drift_max", "peak_vram_mib", "vram_baseline_mib",
     "peak_rss_mib", "cold_start_s", "notes",
 ]
 

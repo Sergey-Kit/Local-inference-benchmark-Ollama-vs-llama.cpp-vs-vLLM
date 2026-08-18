@@ -228,10 +228,20 @@ class TestRestartPolicy:
         """
         assert cfg["server_profiles"]["longctx"].get("restart_between_runs") is True
 
-    def test_interactive_reuses_one_server(self, cfg):
-        # Short prompts leak far less, and a cold start per run would dominate
-        # the concurrency sweep's wall clock for no gain in fidelity.
-        assert not cfg["server_profiles"]["interactive"].get("restart_between_runs", False)
+    def test_interactive_restarts_too(self, cfg):
+        """Short prompts leak less, but they still leak enough to matter.
+
+        Reusing one server across the concurrency sweep, throughput fell run
+        over run in lockstep with RSS -- 216 -> 166 -> 144 tok/s at concurrency
+        16 while RSS climbed 2709 -> 3023 -> 3923 MiB. The median of three runs
+        then describes a degrading process, and which value it lands on depends
+        on run order.
+        """
+        assert cfg["server_profiles"]["interactive"].get("restart_between_runs") is True
+
+    def test_every_profile_restarts(self, cfg):
+        for name, profile in cfg["server_profiles"].items():
+            assert profile.get("restart_between_runs") is True, name
 
 
 class TestOllamaModelStore:
