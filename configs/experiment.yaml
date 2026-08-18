@@ -97,7 +97,7 @@ runtimes:
     port: 11434
     health_path: /
     command:
-      - ollama
+      - vendor/ollama/bin/ollama
       - serve
     env:
       OLLAMA_NUM_PARALLEL: "{parallel}"
