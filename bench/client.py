@@ -70,6 +70,21 @@ class ApiStyle:
             body["ignore_eos"] = True
         return body
 
+    def probe(self, model: str) -> dict:
+        """A minimal non-streaming request, for readiness checks.
+
+        Not the streaming payload with stream flipped off: `stream_options` is
+        only legal alongside `stream: true`, and vLLM rejects the combination
+        with a 400 where llama.cpp and Ollama quietly tolerate it.
+        """
+        return {
+            "model": model,
+            "prompt": "ping",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": False,
+        }
+
     def parse(self, line: str) -> dict | None:
         """SSE: `data: {...}`, terminated by `data: [DONE]`."""
         if not line.startswith("data:"):
@@ -124,6 +139,15 @@ class OllamaNativeStyle(ApiStyle):
                 "temperature": sampling.temperature,
                 "top_p": sampling.top_p,
             },
+        }
+
+    def probe(self, model: str) -> dict:
+        return {
+            "model": model,
+            "prompt": "ping",
+            "raw": True,
+            "stream": False,
+            "options": {"num_predict": 1, "temperature": 0.0},
         }
 
     def parse(self, line: str) -> dict | None:
@@ -236,11 +260,10 @@ class RuntimeClient:
         last_error: str | None = None
         while time.monotonic() < deadline:
             try:
-                probe = self.style.payload(self.served_model, "ping",
-                                           Sampling(max_tokens=1), False)
-                probe["stream"] = False
                 resp = await self.client.post(
-                    f"{self.base_url}{self.style.path}", json=probe, timeout=30.0
+                    f"{self.base_url}{self.style.path}",
+                    json=self.style.probe(self.served_model),
+                    timeout=30.0,
                 )
                 if resp.status_code == 200:
                     return time.monotonic() - started

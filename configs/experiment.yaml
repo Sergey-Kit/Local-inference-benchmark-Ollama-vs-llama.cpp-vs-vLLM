@@ -208,7 +208,21 @@ runtimes:
       # explicitly too: a cache hit would report a spectacular and
       # completely fake TTFT.
       - "--no-enable-prefix-caching"
+    env:
+      # WSL2 disables pinned memory in vLLM by default, and vLLM 0.27's engine
+      # requires UVA, which requires pinned memory -- so the engine dies at
+      # startup with "RuntimeError: UVA is not available". vLLM itself offers
+      # this opt-in for compatible WSL2 kernels (ours is 6.18, far above the
+      # 4.19.121 gate), and pinned allocation was verified working here
+      # directly before enabling it.
+      VLLM_WSL2_ENABLE_PIN_MEMORY: "1"
+      # The sampler probes FlashInfer support by importing it, and flashinfer
+      # 0.6 does not import on Python 3.10 (it annotates with array.array[int],
+      # subscriptable only from 3.11). Ubuntu 22.04 ships 3.10 and installing
+      # 3.11 needs root. Disabling the probe avoids the import; the package is
+      # also uninstalled, see requirements-vllm.txt.
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
     # No VLLM_ATTENTION_BACKEND override. FlashAttention-2 needs sm80, so this
-    # card cannot use it -- but vLLM 0.27 ships no xformers, and naming a
-    # backend that is not installed fails the launch outright. Let vLLM select,
-    # and see runtimes/vllm.md for the ladder to walk if it cannot.
+    # card cannot use it, and vLLM 0.27 ships no xformers -- naming a backend
+    # that is not installed fails the launch outright. Left to select, it picks
+    # TRITON_ATTN here.
