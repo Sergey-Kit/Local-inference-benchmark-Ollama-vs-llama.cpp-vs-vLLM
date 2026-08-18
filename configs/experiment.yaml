@@ -88,6 +88,8 @@ runtimes:
       - "-t"
       - "4"
       - "--no-warmup"
+      - "--cache-reuse"
+      - "0"                  # no cross-request prompt-cache reuse
 
   ollama:
     base_url: http://127.0.0.1:11434/v1
@@ -128,5 +130,9 @@ runtimes:
       - "--port"
       - "8000"
       - "--disable-log-requests"
+      # Prompts are distinct per request, but disable prefix caching
+      # explicitly too: a cache hit would report a spectacular and
+      # completely fake TTFT.
+      - "--no-enable-prefix-caching"
     env:
       VLLM_ATTENTION_BACKEND: "XFORMERS"   # FlashAttention-2 requires sm80
