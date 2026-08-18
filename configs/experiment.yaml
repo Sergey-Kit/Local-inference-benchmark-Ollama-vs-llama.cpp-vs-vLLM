@@ -52,8 +52,15 @@ scenarios:
 measurement:
   warmup_requests: 8      # discarded, per SPEC section 2
   n_runs: 3               # >= 3, median is reported
-  requests_per_run: 16    # requests issued per run at each concurrency level
   request_timeout_s: 600
+  # Requests per run = max(min, factor * concurrency). Issuing only
+  # `concurrency` requests would send one synchronized wave that starts and
+  # finishes together -- which is exactly the case where continuous batching
+  # has nothing to do. Scaling the count with concurrency keeps slots churning,
+  # so the scheduler is actually exercised and the throughput curve measures
+  # what it claims to.
+  requests_per_run_min: 16
+  requests_per_run_factor: 4
 
 monitor:
   poll_interval_s: 0.1

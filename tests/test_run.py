@@ -1,0 +1,166 @@
+"""Tests for the orchestrator's config plumbing.
+
+These cover the substitutions that would fail *silently* rather than loudly:
+a wrong context total still starts a server and still produces numbers, they
+are just numbers for a different experiment than the one described.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from bench.run import (
+    Point,
+    expand_scenarios,
+    load_config,
+    load_prompts,
+    substitution_vars,
+    _fmt,
+)
+
+CONFIG = Path("configs/experiment.yaml")
+PROMPTS = Path("prompts/prompts.jsonl")
+
+
+@pytest.fixture(scope="module")
+def cfg():
+    return load_config(CONFIG)
+
+
+class TestSubstitution:
+    def test_ctx_total_is_per_slot_times_parallel(self, cfg):
+        # llama-server divides -c across --parallel slots, so the config must
+        # hand it the product. Passing ctx_per_slot would give each slot
+        # ctx/parallel and break the long-prompt scenario without erroring.
+        profile = {"parallel": 16, "ctx_per_slot": 512}
+        assert substitution_vars(cfg, profile)["ctx_total"] == 8192
+
+    def test_llamacpp_command_receives_the_total(self, cfg):
+        vars_ = substitution_vars(cfg, cfg["server_profiles"]["interactive"])
+        cmd = [_fmt(p, vars_) for p in cfg["runtimes"]["llamacpp"]["command"]]
+        assert cmd[cmd.index("-c") + 1] == "8192"
+        assert cmd[cmd.index("--parallel") + 1] == "16"
+
+    def test_ollama_context_length_is_per_slot(self, cfg):
+        # Ollama's OLLAMA_CONTEXT_LENGTH is per slot, unlike llama.cpp's -c.
+        # Getting these two the same way round is the whole point of the test.
+        vars_ = substitution_vars(cfg, cfg["server_profiles"]["interactive"])
+        env = {k: _fmt(v, vars_) for k, v in cfg["runtimes"]["ollama"]["env"].items()}
+        assert env["OLLAMA_CONTEXT_LENGTH"] == "512"
+        assert env["OLLAMA_NUM_PARALLEL"] == "16"
+
+    def test_vllm_max_model_len_is_per_slot(self, cfg):
+        vars_ = substitution_vars(cfg, cfg["server_profiles"]["longctx"])
+        cmd = [_fmt(p, vars_) for p in cfg["runtimes"]["vllm"]["command"]]
+        assert cmd[cmd.index("--max-model-len") + 1] == "4096"
+        assert cmd[cmd.index("--max-num-seqs") + 1] == "1"
+
+
+class TestConfigInvariants:
+    def test_every_runtime_is_on_a_distinct_port(self, cfg):
+        ports = [rt["port"] for rt in cfg["runtimes"].values()]
+        assert len(ports) == len(set(ports))
+
+    def test_sampling_is_greedy_and_identical_for_all(self, cfg):
+        assert cfg["sampling"]["temperature"] == 0.0
+        assert cfg["sampling"]["top_p"] == 1.0
+        assert cfg["sampling"]["max_tokens"] > 0
+
+    def test_vllm_forces_fp16_and_no_prefix_cache(self, cfg):
+        cmd = [str(p) for p in cfg["runtimes"]["vllm"]["command"]]
+        # sm75 has no bfloat16; a bf16 default would fail or fall back silently.
+        assert cmd[cmd.index("--dtype") + 1] == "float16"
+        assert "--no-enable-prefix-caching" in cmd
+
+    def test_every_scenario_profile_exists(self, cfg):
+        for scenario in cfg["scenarios"]:
+            assert scenario["profile"] in cfg["server_profiles"]
+
+    def test_longctx_profile_fits_the_long_prompt(self, cfg):
+        """The long prompt plus its output must fit one slot."""
+        if not PROMPTS.exists():
+            pytest.skip("prompts not built yet")
+        sets = load_prompts(PROMPTS)
+        needed = sets["long"][0].n_tokens + cfg["sampling"]["max_tokens"]
+        assert cfg["server_profiles"]["longctx"]["ctx_per_slot"] >= needed
+
+    def test_interactive_profile_fits_the_short_prompt(self, cfg):
+        if not PROMPTS.exists():
+            pytest.skip("prompts not built yet")
+        sets = load_prompts(PROMPTS)
+        needed = sets["short"][0].n_tokens + cfg["sampling"]["max_tokens"]
+        assert cfg["server_profiles"]["interactive"]["ctx_per_slot"] >= needed
+
+
+class TestMatrix:
+    def test_expands_to_the_documented_matrix(self, cfg):
+        points = expand_scenarios(cfg)
+        assert Point("concurrency_sweep", "interactive", "short", 16) in points
+        assert Point("prompt_length", "longctx", "long", 1) in points
+        assert len(points) == 6
+
+    def test_enough_prompts_for_the_largest_run(self, cfg):
+        """One distinct prompt per request in the largest run.
+
+        run_batch cycles the prompt list, so if a run issues more requests than
+        there are prompts, some prompts repeat -- and a repeat is a prefix-cache
+        hit waiting to happen. Prefix caching is disabled by flag as well, but
+        the data should not depend on the flag being honoured.
+        """
+        if not PROMPTS.exists():
+            pytest.skip("prompts not built yet")
+        from bench.run import requests_for
+        sets = load_prompts(PROMPTS)
+        widest = max(c for s in cfg["scenarios"] for c in s["concurrency"])
+        largest_run = requests_for(cfg["measurement"], widest)
+        assert len(sets["short"]) >= largest_run
+        assert len(sets["long"]) >= requests_for(cfg["measurement"], 1)
+
+
+class TestPrompts:
+    def test_lengths_are_exact_and_uniform(self):
+        if not PROMPTS.exists():
+            pytest.skip("prompts not built yet")
+        sets = load_prompts(PROMPTS)
+        assert {p.n_tokens for p in sets["short"]} == {64}
+        assert {p.n_tokens for p in sets["long"]} == {2560}
+
+    def test_prompts_do_not_share_prefixes(self):
+        if not PROMPTS.exists():
+            pytest.skip("prompts not built yet")
+        sets = load_prompts(PROMPTS)
+        texts = [p.text for ps in sets.values() for p in ps]
+        assert len({t[:400] for t in texts}) == len(texts)
+
+    def test_thinking_mode_is_disabled(self):
+        """Qwen3's thinking mode would make output length a hidden variable."""
+        if not PROMPTS.exists():
+            pytest.skip("prompts not built yet")
+        rows = [json.loads(l) for l in PROMPTS.read_text().splitlines() if l.strip()]
+        for row in rows:
+            assert row["text"].rstrip().endswith("</think>")
+
+    def test_rejects_mixed_length_sets(self, tmp_path):
+        bad = tmp_path / "bad.jsonl"
+        bad.write_text(
+            json.dumps({"name": "a", "prompt_set": "short", "text": "x", "n_tokens": 64}) + "\n"
+            + json.dumps({"name": "b", "prompt_set": "short", "text": "y", "n_tokens": 65}) + "\n"
+        )
+        with pytest.raises(SystemExit):
+            load_prompts(bad)
+
+
+class TestRequestCount:
+    def test_scales_with_concurrency(self, cfg):
+        from bench.run import requests_for
+        m = cfg["measurement"]
+        # A synchronized single wave (n == concurrency) would never exercise the
+        # scheduler's ability to backfill freed slots, which is the entire
+        # mechanism the throughput figure is meant to reveal.
+        for c in (1, 4, 8, 16):
+            assert requests_for(m, c) >= max(16, 2 * c)
+
+    def test_never_below_the_floor(self, cfg):
+        from bench.run import requests_for
+        assert requests_for(cfg["measurement"], 1) == 16

@@ -203,6 +203,14 @@ def expand_scenarios(cfg: dict) -> list[Point]:
     return points
 
 
+def requests_for(measurement: dict, concurrency: int) -> int:
+    """Enough requests that the server reaches steady state at this concurrency."""
+    return max(
+        int(measurement["requests_per_run_min"]),
+        int(measurement["requests_per_run_factor"]) * concurrency,
+    )
+
+
 async def measure_point(
     client: RuntimeClient,
     point: Point,
@@ -213,6 +221,7 @@ async def measure_point(
     cold_start_s: float | None,
 ) -> list[RunSummary]:
     summaries: list[RunSummary] = []
+    n_requests = requests_for(measurement, point.concurrency)
     for run_index in range(int(measurement["n_runs"])):
         monitor.start()
         records, wall = await client.run_batch(
@@ -220,7 +229,7 @@ async def measure_point(
             sampling,
             scenario=point.scenario,
             concurrency=point.concurrency,
-            n_requests=int(measurement["requests_per_run"]),
+            n_requests=n_requests,
             run_index=run_index,
         )
         res = monitor.stop()
@@ -314,7 +323,8 @@ async def run_runtime(
                 await client.warmup(warm_prompt, sampling, n=int(measurement["warmup_requests"]))
 
                 for point in profile_points:
-                    print(f"    {point.scenario} / {point.prompt_set} / concurrency {point.concurrency}")
+                    print(f"    {point.scenario} / {point.prompt_set} / concurrency {point.concurrency} "
+                          f"({requests_for(measurement, point.concurrency)} requests/run)")
                     summaries = await measure_point(
                         client, point, prompt_sets[point.prompt_set], sampling,
                         monitor, measurement, cold_start_s,
@@ -326,6 +336,7 @@ async def run_runtime(
                     agg["profile"] = profile_name
                     agg["prompt_tokens"] = prompt_sets[point.prompt_set][0].n_tokens
                     agg["max_tokens"] = sampling.max_tokens
+                    agg["requests_per_run"] = requests_for(measurement, point.concurrency)
                     agg["vram_baseline_mib"] = baseline
                     aggregates.append(agg)
         finally:
@@ -341,7 +352,7 @@ async def run_runtime(
 
 SUMMARY_COLUMNS = [
     "runtime", "scenario", "profile", "prompt_set", "prompt_tokens", "max_tokens",
-    "concurrency", "n_runs", "n_failed_total", "throughput_tok_s", "ttft_ms_p50",
+    "concurrency", "requests_per_run", "n_runs", "n_failed_total", "throughput_tok_s", "ttft_ms_p50",
     "ttft_ms_p95", "tpot_ms_p50", "peak_vram_mib", "vram_baseline_mib",
     "peak_rss_mib", "cold_start_s", "notes",
 ]
@@ -377,13 +388,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(f"{len(runtimes)} runtime(s) x {len(points)} point(s) "
               f"x {cfg['measurement']['n_runs']} run(s) = "
-              f"{len(runtimes) * len(points) * cfg['measurement']['n_runs']} runs, "
-              f"{cfg['measurement']['requests_per_run']} requests each")
+              f"{len(runtimes) * len(points) * cfg['measurement']['n_runs']} runs")
         for runtime in runtimes:
             print(f"\n{runtime}:")
             for point in points:
                 print(f"  {point.scenario:20s} profile={point.profile:12s} "
-                      f"{point.prompt_set:6s} concurrency={point.concurrency}")
+                      f"{point.prompt_set:6s} concurrency={point.concurrency:2d} "
+                      f"requests/run={requests_for(cfg['measurement'], point.concurrency)}")
         return 0
 
     prompt_sets = load_prompts(args.prompts)
