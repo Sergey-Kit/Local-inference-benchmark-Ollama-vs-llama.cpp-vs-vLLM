@@ -288,7 +288,9 @@ async def server_session(cfg, runtime, profile_name, profile, count_tokens, out_
         ) as client:
             monitor.start()
             try:
-                cold_start_s = await client.wait_ready(timeout_s=900.0)
+                cold_start_s = await client.wait_ready(
+                    timeout_s=900.0, alive=manager.check_alive
+                )
             finally:
                 load_res = monitor.stop()
             manager.check_alive()

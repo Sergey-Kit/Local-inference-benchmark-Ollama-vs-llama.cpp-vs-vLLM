@@ -246,7 +246,12 @@ class RuntimeClient:
             raise RuntimeError("RuntimeClient must be used as an async context manager")
         return self._client
 
-    async def wait_ready(self, timeout_s: float = 600.0, poll_s: float = 0.25) -> float:
+    async def wait_ready(
+        self,
+        timeout_s: float = 600.0,
+        poll_s: float = 0.25,
+        alive: Callable[[], None] | None = None,
+    ) -> float:
         """Block until the server answers a real generation request.
 
         Returns seconds waited. This is the cold-start metric from SPEC section
@@ -259,6 +264,11 @@ class RuntimeClient:
         deadline = started + timeout_s
         last_error: str | None = None
         while time.monotonic() < deadline:
+            # A server that rejected its own command line is not going to
+            # become ready in ten more minutes. Waiting out the full timeout on
+            # a corpse cost 15 minutes to discover a one-word CLI change.
+            if alive is not None:
+                alive()
             try:
                 resp = await self.client.post(
                     f"{self.base_url}{self.style.path}",

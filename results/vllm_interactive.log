@@ -1,0 +1,6 @@
+# .venv-vllm/bin/vllm serve models/Qwen3-0.6B --dtype float16 --enforce-eager --max-model-len 512 --max-num-seqs 16 --gpu-memory-utilization 0.80 --port 8000 --disable-log-requests --no-enable-prefix-caching
+# VLLM_USE_FLASHINFER_SAMPLER=0
+# VLLM_WSL2_ENABLE_PIN_MEMORY=1
+usage: vllm [-h] [-v]
+            {chat,complete,serve,launch,bench,collect-env,run-batch} ...
+vllm: error: unrecognized arguments: --disable-log-requests

@@ -203,7 +203,6 @@ runtimes:
       - "0.80"             # the desktop already holds ~13% of the card
       - "--port"
       - "8000"
-      - "--disable-log-requests"
       # Prompts are distinct per request, but disable prefix caching
       # explicitly too: a cache hit would report a spectacular and
       # completely fake TTFT.

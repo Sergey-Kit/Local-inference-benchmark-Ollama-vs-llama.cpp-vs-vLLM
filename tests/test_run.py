@@ -335,3 +335,25 @@ class TestOllamaFlashAttention:
         result is invisible in the configuration it prints.
         """
         assert "OLLAMA_FLASH_ATTENTION" not in cfg["runtimes"]["ollama"]["env"]
+
+
+class TestVllmCommand:
+    def test_no_removed_flags(self, cfg):
+        """--disable-log-requests was removed in vLLM 0.27.
+
+        vllm exits immediately with "unrecognized arguments", and before
+        wait_ready learned to check liveness the harness sat waiting on the
+        corpse for its full 900 s timeout.
+        """
+        cmd = [str(x) for x in cfg["runtimes"]["vllm"]["command"]]
+        assert "--disable-log-requests" not in cmd
+
+    def test_forces_fp16_and_eager(self, cfg):
+        cmd = [str(x) for x in cfg["runtimes"]["vllm"]["command"]]
+        assert cmd[cmd.index("--dtype") + 1] == "float16"   # sm75 has no bf16
+        assert "--enforce-eager" in cmd
+
+    def test_wsl_and_flashinfer_workarounds_present(self, cfg):
+        env = cfg["runtimes"]["vllm"]["env"]
+        assert env["VLLM_WSL2_ENABLE_PIN_MEMORY"] == "1"
+        assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
