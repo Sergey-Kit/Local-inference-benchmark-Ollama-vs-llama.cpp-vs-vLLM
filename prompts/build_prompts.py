@@ -133,10 +133,14 @@ def main() -> int:
     print(f"loading tokenizer from {src}")
     tok = AutoTokenizer.from_pretrained(src)
 
-    rng = random.Random(args.seed)
     rows = []
     for prompt_set, target, count in (("short", args.short_tokens, args.count),
                                       ("long", args.long_tokens, args.long_count)):
+        # One generator per set, seeded from the set's name. With a single
+        # shared generator, asking for more short prompts shifts every long
+        # prompt too -- so raising one count silently invalidates results
+        # measured on the other set.
+        rng = random.Random(f"{args.seed}:{prompt_set}")
         for i in range(count):
             rows.append(build_prompt(tok, rng, target, f"{prompt_set}_{i:03d}", prompt_set))
         actual = {r["n_tokens"] for r in rows if r["prompt_set"] == prompt_set}

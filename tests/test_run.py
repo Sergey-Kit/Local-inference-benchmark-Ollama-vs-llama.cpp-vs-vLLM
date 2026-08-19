@@ -35,20 +35,24 @@ class TestSubstitution:
         # ctx/parallel and break the long-prompt scenario without erroring.
         profile = {"parallel": 16, "ctx_per_slot": 512}
         assert substitution_vars(cfg, profile)["ctx_total"] == 8192
+        assert substitution_vars(cfg, {"parallel": 32, "ctx_per_slot": 512})["ctx_total"] == 16384
 
     def test_llamacpp_command_receives_the_total(self, cfg):
-        vars_ = substitution_vars(cfg, cfg["server_profiles"]["interactive"])
+        profile = cfg["server_profiles"]["interactive"]
+        vars_ = substitution_vars(cfg, profile)
         cmd = [_fmt(p, vars_) for p in cfg["runtimes"]["llamacpp"]["command"]]
-        assert cmd[cmd.index("-c") + 1] == "8192"
-        assert cmd[cmd.index("--parallel") + 1] == "16"
+        expected = profile["parallel"] * profile["ctx_per_slot"]
+        assert cmd[cmd.index("-c") + 1] == str(expected)
+        assert cmd[cmd.index("--parallel") + 1] == str(profile["parallel"])
 
     def test_ollama_context_length_is_per_slot(self, cfg):
         # Ollama's OLLAMA_CONTEXT_LENGTH is per slot, unlike llama.cpp's -c.
         # Getting these two the same way round is the whole point of the test.
-        vars_ = substitution_vars(cfg, cfg["server_profiles"]["interactive"])
+        profile = cfg["server_profiles"]["interactive"]
+        vars_ = substitution_vars(cfg, profile)
         env = {k: _fmt(v, vars_) for k, v in cfg["runtimes"]["ollama"]["env"].items()}
-        assert env["OLLAMA_CONTEXT_LENGTH"] == "512"
-        assert env["OLLAMA_NUM_PARALLEL"] == "16"
+        assert env["OLLAMA_CONTEXT_LENGTH"] == str(profile["ctx_per_slot"])
+        assert env["OLLAMA_NUM_PARALLEL"] == str(profile["parallel"])
 
     def test_vllm_max_model_len_is_per_slot(self, cfg):
         vars_ = substitution_vars(cfg, cfg["server_profiles"]["longctx"])
@@ -99,9 +103,14 @@ class TestMatrix:
         # Compare on what identifies a point, not on the whole dataclass: the
         # per-scenario tuning that rides along is not part of its identity.
         ids = {(p.scenario, p.profile, p.prompt_set, p.concurrency) for p in points}
-        assert ("concurrency_sweep", "interactive", "short", 16) in ids
+        widest = max(cfg["scenarios"][0]["concurrency"])
+        assert ("concurrency_sweep", "interactive", "short", widest) in ids
         assert ("prompt_length", "longctx", "long", 1) in ids
-        assert len(points) == 6
+        expected = sum(
+            len(s["concurrency"]) * (1 if isinstance(s["prompt_set"], str) else len(s["prompt_set"]))
+            for s in cfg["scenarios"]
+        )
+        assert len(points) == expected
 
     def test_enough_prompts_for_every_run_plus_warmup(self, cfg):
         """No prompt is ever seen twice by one server.
@@ -294,9 +303,10 @@ class TestServerEnvironment:
         from bench.run import ServerManager
 
         mgr = ServerManager(cfg, "ollama", Path("."))
-        env = mgr.env_overrides(cfg["server_profiles"]["interactive"])
-        assert env["OLLAMA_NUM_PARALLEL"] == "16"
-        assert env["OLLAMA_CONTEXT_LENGTH"] == "512"
+        profile = cfg["server_profiles"]["interactive"]
+        env = mgr.env_overrides(profile)
+        assert env["OLLAMA_NUM_PARALLEL"] == str(profile["parallel"])
+        assert env["OLLAMA_CONTEXT_LENGTH"] == str(profile["ctx_per_slot"])
         assert env["OLLAMA_MODELS"].startswith("/")
         assert "{" not in "".join(env.values()), "unsubstituted placeholder left in env"
 
@@ -318,10 +328,11 @@ class TestServerEnvironment:
 
         monkeypatch.setattr(run_mod.subprocess, "Popen", FakePopen)
         monkeypatch.setattr(run_mod, "port_is_open", lambda *a, **k: False)
+        profile = cfg["server_profiles"]["interactive"]
         mgr = run_mod.ServerManager(cfg, "ollama", Path("/tmp"))
-        mgr.launch("interactive", cfg["server_profiles"]["interactive"])
+        mgr.launch("interactive", profile)
         assert captured["env"] is not None, "Popen was called without env"
-        assert captured["env"]["OLLAMA_NUM_PARALLEL"] == "16"
+        assert captured["env"]["OLLAMA_NUM_PARALLEL"] == str(profile["parallel"])
         mgr.log_file.close()
 
 
@@ -357,3 +368,22 @@ class TestVllmCommand:
         env = cfg["runtimes"]["vllm"]["env"]
         assert env["VLLM_WSL2_ENABLE_PIN_MEMORY"] == "1"
         assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+
+
+class TestVramBudget:
+    def test_widest_point_fits_the_card(self, cfg):
+        """The widest sweep point must fit 4 GiB with the desktop's share.
+
+        KV costs 112 KiB/token for this model (2 x 28 layers x 8 kv_heads x
+        128 head_dim x 2 bytes) and FP16 weights are ~1.2 GiB. Measured at 32
+        slots: 3437 MiB of 4096 with the server loaded. This asserts the
+        arithmetic that made that predictable rather than lucky.
+        """
+        profile = cfg["server_profiles"]["interactive"]
+        kv_mib_per_token = 2 * 28 * 8 * 128 * 2 / 1024 / 1024
+        kv = profile["parallel"] * profile["ctx_per_slot"] * kv_mib_per_token
+        weights = 1229          # 0.6B params at FP16, tied embeddings
+        desktop = 600           # observed baseline range 385-860 MiB
+        assert kv + weights + desktop < 4096, (
+            f"KV {kv:.0f} + weights {weights} + desktop {desktop} exceeds the card"
+        )

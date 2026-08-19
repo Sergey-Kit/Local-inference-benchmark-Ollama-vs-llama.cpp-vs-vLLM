@@ -58,8 +58,13 @@ sampling:
 # it must not be allowed to leak into the cross-runtime comparison.
 server_profiles:
   interactive:            # short prompts, many slots
-    parallel: 16
-    ctx_per_slot: 512     # 16 * 512 = 8192 tokens ~= 896 MiB KV
+    # Sized for the widest point in the sweep: 32 slots x 512 tokens = 16,384
+    # tokens of KV at 112 KiB/token = 1.75 GiB, plus 1.2 GiB of FP16 weights.
+    # With the desktop's ~550 MiB baseline that is ~3.8 GiB of a 4 GiB card --
+    # tight, and the reason the projection was computed before running rather
+    # than after failing.
+    parallel: 32
+    ctx_per_slot: 512
     restart_between_runs: true
   longctx:                # one slot, room for a ~2.5k-token prompt
     parallel: 1
@@ -79,7 +84,13 @@ scenarios:
   - name: concurrency_sweep
     profile: interactive
     prompt_set: short
-    concurrency: [1, 4, 8, 16]
+    # 32 is where the question actually gets answered. vLLM scales x5.5 across
+    # 1..16 against llama.cpp's x2.1 but starts a fifth as fast, so the curves
+    # imply a crossover past 30 -- and vLLM's KV pool here holds 17,792 tokens,
+    # about 34 concurrent 512-token sequences, so that point is just inside what
+    # this card can physically hold. Measuring it turns an extrapolation into a
+    # number.
+    concurrency: [1, 4, 8, 16, 32]
   - name: prompt_length
     profile: longctx
     prompt_set: [short, long]

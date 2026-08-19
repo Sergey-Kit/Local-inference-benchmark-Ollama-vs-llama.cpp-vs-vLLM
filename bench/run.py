@@ -528,12 +528,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default="configs/experiment.yaml")
     ap.add_argument("--prompts", default="prompts/prompts.jsonl")
     ap.add_argument("--runtime", action="append", help="restrict to these runtimes (repeatable)")
+    ap.add_argument("--concurrency", action="append", type=int,
+                    help="restrict to these concurrency levels (repeatable). Results merge "
+                         "into summary.csv by measurement point, so a single point can be "
+                         "added to an existing matrix without re-running the rest.")
+    ap.add_argument("--scenario", action="append", help="restrict to these scenarios (repeatable)")
     ap.add_argument("--out", default="results")
     ap.add_argument("--dry-run", action="store_true", help="print the matrix, launch nothing")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
     points = expand_scenarios(cfg)
+    if args.scenario:
+        points = [p for p in points if p.scenario in set(args.scenario)]
+    if args.concurrency:
+        points = [p for p in points if p.concurrency in set(args.concurrency)]
+    if not points:
+        raise SystemExit("no measurement points match the given filters")
     runtimes = args.runtime or list(cfg["runtimes"])
     unknown = set(runtimes) - set(cfg["runtimes"])
     if unknown:
