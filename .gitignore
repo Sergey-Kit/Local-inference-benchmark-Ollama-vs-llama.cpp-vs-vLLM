@@ -1,10 +1,14 @@
 # Python
 __pycache__/
 *.py[cod]
-.venv/
-.venv-vllm/
 *.egg-info/
 .pytest_cache/
+
+# Every virtualenv, by pattern rather than by name. Listing them individually
+# meant .venv-convert -- created later, for the GGUF converter's torch -- was
+# not covered, and 819 MB of it went into the history before GitHub refused the
+# push over a 425 MB libtorch_cpu.so.
+.venv*/
 
 # Models and third-party sources (huge, fetched by scripts/)
 models/
