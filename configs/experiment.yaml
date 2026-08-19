@@ -1,0 +1,255 @@
+# P1 inference benchmark -- single source of truth for the whole experiment.
+# Nothing about the model or the runtimes is hardcoded in bench/*.py; this file
+# is meant to travel to P2/P5 with only the `model` and `runtimes` blocks changed.
+
+model:
+  hf_id: Qwen/Qwen3-0.6B
+  local_dir: models/Qwen3-0.6B          # safetensors, consumed by vLLM
+  gguf: models/Qwen3-0.6B-f16.gguf      # converted from the SAME safetensors
+  ollama_tag: qwen3-06b-f16             # imported from the SAME gguf via Modelfile
+  # Forced everywhere: Qwen3 ships bfloat16, which Turing (sm75) has no hardware
+  # support for. FP16 is the one dtype all three runtimes can agree on here.
+  dtype: float16
+
+# Identical on every runtime. temperature=0 makes runs comparable; ignore_eos
+# makes every runtime emit exactly max_tokens, so TPOT and throughput are not
+# contaminated by runtimes deciding to stop at different lengths.
+sampling:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 128
+  # OFF, and this was a real finding rather than a default.
+  #
+  # ignore_eos makes every runtime emit exactly max_tokens, which looks like the
+  # fairest possible setup. On this model it is not: forcing Qwen3 to generate
+  # past its natural stop makes it emit control text that llama-server's output
+  # parser rejects, and it kills ~6% of streams mid-generation with
+  #   "The model produced output that does not match the expected Content-only format"
+  # (measured: 2/32 requests; --no-jinja and --reasoning-format none do not help).
+  # Ollama's OpenAI layer does not forward ignore_eos at all, so the setting
+  # could never have been symmetric across the three runtimes anyway.
+  #
+  # Leaving it off makes the request parameters identical everywhere, which is
+  # the project's one rule. TTFT, TPOT and tokens/s are all rates normalised by
+  # token count, so a varying output length does not bias them -- and
+  # output_tokens_p50 is reported per point so that a runtime generating
+  # systematically less is visible rather than hidden.
+  ignore_eos: false
+
+# The chat template is applied once, by prompts/build_prompts.py, and every
+# runtime is then handed the finished string. Each runtime's `api:` below names
+# the request shape that delivers that string *unmodified* -- for two of them
+# the OpenAI completions endpoint does, for Ollama it does not (see its note).
+# Getting this wrong is invisible: the prompt still works, it is just no longer
+# the same prompt, and every prefill and TTFT number silently describes a
+# different experiment.
+
+# KV cache for this model costs 112 KiB/token (2 * 28 layers * 8 kv_heads *
+# 128 head_dim * 2 bytes). With ~3.5 GB of usable VRAM the concurrency sweep and
+# the long-prompt test cannot share one server configuration, so each gets its
+# own profile and its own server launch.
+# Every profile takes a fresh server per run, so the three runs of a point are
+# independent replicates rather than successive states of one process. This is
+# not tidiness. Reusing a server, llama.cpp's throughput fell monotonically run
+# over run in lockstep with its RSS -- 216 -> 166 -> 144 tok/s at concurrency 16
+# while RSS climbed 2709 -> 3023 -> 3923 MiB -- so the median of three runs was
+# reporting a degrading system, and which number you got depended on run order.
+# The degradation is itself a finding and is written up in runtimes/llamacpp.md;
+# it must not be allowed to leak into the cross-runtime comparison.
+server_profiles:
+  interactive:            # short prompts, many slots
+    # Sized for the widest point in the sweep: 32 slots x 512 tokens = 16,384
+    # tokens of KV at 112 KiB/token = 1.75 GiB, plus 1.2 GiB of FP16 weights.
+    # With the desktop's ~550 MiB baseline that is ~3.8 GiB of a 4 GiB card --
+    # tight, and the reason the projection was computed before running rather
+    # than after failing.
+    parallel: 32
+    ctx_per_slot: 512
+    restart_between_runs: true
+  longctx:                # one slot, room for a ~2.5k-token prompt
+    parallel: 1
+    ctx_per_slot: 4096    # 4096 tokens ~= 448 MiB KV
+    # A fresh server for every run, as above. llama-server leaks host RAM per request on
+    # this build -- roughly 70 MiB fixed plus 70 KiB per prompt token, so about
+    # 295 MiB for a 2560-token prompt -- and 5.5 GB of RAM buys about sixteen
+    # of those before the kernel OOM-kills it mid-measurement. (Confirmed by
+    # dmesg: "Out of memory: Killed process llama-server, anon-rss 4871812kB".
+    # Not CUDA graph caching and not glibc arena fragmentation: disabling
+    # GGML_CUDA_DISABLE_GRAPHS and pinning MALLOC_ARENA_MAX both leave the
+    # slope unchanged.) Restarting also makes the runs independent replicates
+    # rather than successive states of one increasingly degraded process.
+    restart_between_runs: true
+
+scenarios:
+  - name: concurrency_sweep
+    profile: interactive
+    prompt_set: short
+    # 32 is where the question actually gets answered. vLLM scales x5.5 across
+    # 1..16 against llama.cpp's x2.1 but starts a fifth as fast, so the curves
+    # imply a crossover past 30 -- and vLLM's KV pool here holds 17,792 tokens,
+    # about 34 concurrent 512-token sequences, so that point is just inside what
+    # this card can physically hold. Measuring it turns an extrapolation into a
+    # number.
+    concurrency: [1, 4, 8, 16, 32]
+  - name: prompt_length
+    profile: longctx
+    prompt_set: [short, long]
+    concurrency: [1]
+    # Fewer requests than the sweep. A 2560-token prefill costs ~6 s on this
+    # GPU against <1 s of generation, so each request here is ~8x the cost of a
+    # short one -- while the quantity being measured, single-stream TTFT, is
+    # both low-variance and measured once per request. 8 x 3 runs = 24 samples.
+    requests_per_run_min: 8
+
+measurement:
+  # Discarded, per SPEC section 2. Four, not eight: warm-up exists to get past
+  # first-call CUDA kernel setup and buffer allocation, which a couple of
+  # requests already do. It is paid once per server launch, so on a profile
+  # that takes a fresh server per run it is paid per run -- at 2560-token
+  # prompts, eight warm-up requests cost ~64 s each time, which was half the
+  # wall clock of the long-prompt scenario.
+  warmup_requests: 4
+  n_runs: 3               # >= 3, median is reported
+  request_timeout_s: 600
+  # Requests per run = max(min, factor * concurrency). Issuing only
+  # `concurrency` requests would send one synchronized wave that starts and
+  # finishes together -- which is exactly the case where continuous batching
+  # has nothing to do. Scaling the count with concurrency keeps slots churning,
+  # so the scheduler is actually exercised and the throughput curve measures
+  # what it claims to.
+  requests_per_run_min: 16
+  requests_per_run_factor: 4
+
+monitor:
+  poll_interval_s: 0.1
+  # WSL2 does not expose per-process GPU memory (nvidia-smi
+  # --query-compute-apps returns an empty table), so peak VRAM is measured as
+  # device-wide `used` minus a baseline sampled before the server starts.
+  baseline_settle_s: 2.0
+
+runtimes:
+  llamacpp:
+    base_url: http://127.0.0.1:8080/v1
+    served_model: "{gguf}"
+    port: 8080
+    health_path: /health
+    # -c is the TOTAL context shared by all slots and is divided by --parallel.
+    # Passing ctx_per_slot here instead of parallel*ctx_per_slot would silently
+    # give each slot ctx/16 and break the long-prompt scenario.
+    command:
+      - vendor/llama.cpp/build/bin/llama-server
+      - "-m"
+      - "{gguf}"
+      - "-ngl"
+      - "99"
+      - "--parallel"
+      - "{parallel}"
+      - "-c"
+      - "{ctx_total}"
+      - "--host"
+      - "127.0.0.1"
+      - "--port"
+      - "8080"
+      - "-t"
+      - "4"
+      - "--no-warmup"
+      - "--cache-reuse"
+      - "0"                  # no cross-request prompt-cache reuse
+
+  ollama:
+    # Ollama's own API, not its OpenAI-compatible layer. /v1/completions
+    # re-applies the chat template to a prompt that already has one: the same
+    # string arrives as 72 tokens instead of 64, and the re-templating turns
+    # Qwen3's thinking mode back on, so the model burns its budget on a <think>
+    # block and hits max_tokens. /api/generate with raw=true passes the prompt
+    # through untouched -- 64 tokens, matching llama.cpp exactly.
+    api: ollama_native
+    base_url: http://127.0.0.1:11434
+    served_model: "{ollama_tag}"
+    port: 11434
+    health_path: /
+    command:
+      - vendor/ollama/bin/ollama
+      - serve
+    env:
+      # In-tree model store. Without this Ollama reads ~/.ollama and would not
+      # find the F16 import at all -- and `ollama pull`-ing a replacement is
+      # exactly the substitution this project exists to avoid.
+      OLLAMA_MODELS: "{repo_root}/vendor/ollama/models"
+      OLLAMA_NUM_PARALLEL: "{parallel}"
+      OLLAMA_CONTEXT_LENGTH: "{ctx_per_slot}"
+      OLLAMA_KEEP_ALIVE: "24h"       # otherwise the model unloads between runs
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      # OLLAMA_FLASH_ATTENTION is deliberately NOT set.
+      #
+      # It was set to "0" here on the reasoning that sm75 has no
+      # FlashAttention-2 and the configuration should be stated rather than
+      # inferred. Measured cost of that tidiness: TTFT p50 3074 ms with the
+      # variable set to "0" against 570 ms with it unset -- 5.4x, on identical
+      # everything else. Ollama's own startup log prints FLASH_ATTENTION:false
+      # in both cases, so the setting that changes the number does not appear
+      # in the record of what was configured. Leaving it unset also matches
+      # llama-server, which we likewise leave on its default.
+    # Ollama's OpenAI layer does not forward ignore_eos. Recorded as a known
+    # deviation; the client falls back to counting tokens actually returned.
+    supports_ignore_eos: false
+    options:
+      # Ollama's equivalent of llama.cpp's -ngl 99, and required for the two to
+      # be comparable at all. At 32 slots the KV cache needs 1792 MiB, and
+      # Ollama's memory fitter concludes the model does not fit and quietly
+      # leaves 9 of 29 layers on the CPU:
+      #     load_tensors: offloaded 20/29 layers to GPU
+      #     sched_reserve: graph splits = 119
+      # On this CPU, without AVX2 and across PCIe 2.0, that costs 5x -- 8.4
+      # tok/s against 42.9 at concurrency 1.
+      #
+      # llama.cpp's fitter reaches the same conclusion on the same hardware:
+      #     failed to fit params to free device memory:
+      #     n_gpu_layers already set by user to 99, abort
+      # It was simply told what to do, ignored the verdict, and ran fine at
+      # 3437 MiB. The fitter was wrong; only one of the two runtimes was in a
+      # position to find out. Asking Ollama explicitly puts them on equal terms.
+      num_gpu: 99
+
+  vllm:
+    base_url: http://127.0.0.1:8000/v1
+    served_model: "{local_dir}"
+    port: 8000
+    health_path: /health
+    command:
+      - .venv-vllm/bin/vllm
+      - serve
+      - "{local_dir}"
+      - "--dtype"
+      - "float16"          # no bfloat16 on sm75
+      - "--enforce-eager"  # CUDA graph capture costs VRAM we do not have
+      - "--max-model-len"
+      - "{ctx_per_slot}"
+      - "--max-num-seqs"
+      - "{parallel}"
+      - "--gpu-memory-utilization"
+      - "0.80"             # the desktop already holds ~13% of the card
+      - "--port"
+      - "8000"
+      # Prompts are distinct per request, but disable prefix caching
+      # explicitly too: a cache hit would report a spectacular and
+      # completely fake TTFT.
+      - "--no-enable-prefix-caching"
+    env:
+      # WSL2 disables pinned memory in vLLM by default, and vLLM 0.27's engine
+      # requires UVA, which requires pinned memory -- so the engine dies at
+      # startup with "RuntimeError: UVA is not available". vLLM itself offers
+      # this opt-in for compatible WSL2 kernels (ours is 6.18, far above the
+      # 4.19.121 gate), and pinned allocation was verified working here
+      # directly before enabling it.
+      VLLM_WSL2_ENABLE_PIN_MEMORY: "1"
+      # The sampler probes FlashInfer support by importing it, and flashinfer
+      # 0.6 does not import on Python 3.10 (it annotates with array.array[int],
+      # subscriptable only from 3.11). Ubuntu 22.04 ships 3.10 and installing
+      # 3.11 needs root. Disabling the probe avoids the import; the package is
+      # also uninstalled, see requirements-vllm.txt.
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    # No VLLM_ATTENTION_BACKEND override. FlashAttention-2 needs sm80, so this
+    # card cannot use it, and vLLM 0.27 ships no xformers -- naming a backend
+    # that is not installed fails the launch outright. Left to select, it picks
+    # TRITON_ATTN here.

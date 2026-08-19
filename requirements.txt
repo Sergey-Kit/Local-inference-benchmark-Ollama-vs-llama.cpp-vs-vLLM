@@ -1,0 +1,30 @@
+# Benchmark harness only -- deliberately light, so it installs on the
+# measurement machine without pulling a CUDA torch build.
+# vLLM lives in a separate venv, see requirements-vllm.txt.
+#
+#   python3 -m venv .venv && .venv/bin/python -m pip install -U pip
+#   .venv/bin/python -m pip install -r requirements.txt
+#
+# Versions are the ones the reported results were produced with.
+httpx==0.28.1
+PyYAML==6.0.3
+nvidia-ml-py==13.610.43
+psutil==7.2.2
+# Cross-runtime source of truth for tokenization. Qwen3 needs >=4.51.
+transformers==5.15.0
+huggingface-hub==1.28.0
+pandas==2.3.3
+matplotlib==3.10.9
+pytest==9.1.1
+
+# Needed by the setup scripts rather than by the harness itself, but installed
+# from here so `pip install -r requirements.txt` leaves the repo buildable
+# without any further hunting:
+#   cmake, ninja  -> scripts/build_llamacpp.sh (a pip cmake avoids needing root)
+#   jinja2        -> prompts/build_prompts.py, for apply_chat_template
+#   zstandard     -> scripts/install_ollama.sh; Ollama releases are .tar.zst and
+#                    this box has neither the zstd binary nor a tar built on it
+cmake==4.4.2
+ninja==1.13.0
+Jinja2==3.1.6
+zstandard==0.25.0

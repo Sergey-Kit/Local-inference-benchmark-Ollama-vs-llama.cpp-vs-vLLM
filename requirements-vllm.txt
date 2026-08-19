@@ -1,0 +1,20 @@
+# Installed into a SEPARATE venv (.venv-vllm): vLLM pins its own torch build
+# (~10 GB) and would clobber the harness venv.
+#   python3 -m venv .venv-vllm && .venv-vllm/bin/pip install -r requirements-vllm.txt
+vllm==0.10.1.1
+
+# flashinfer is deliberately NOT installed.
+#
+# vLLM pulls it in via requirements/cuda.txt, but flashinfer 0.6 does not
+# import on Python 3.10 -- it annotates a function with `array.array[int]`,
+# which only became subscriptable in 3.11 -- and vLLM's sampler probes for it
+# by importing it, so the engine dies at startup. Ubuntu 22.04 ships Python
+# 3.10 and installing 3.11 requires root. After installing:
+#
+#   .venv-vllm/bin/python -m pip uninstall -y flashinfer-python
+#
+# and VLLM_USE_FLASHINFER_SAMPLER=0 (set in configs/experiment.yaml) stops the
+# probe from importing it at all.
+#
+# scripts/install_vllm.sh does all of this, and checks afterwards that
+# flashinfer really is gone.
