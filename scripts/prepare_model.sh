@@ -38,12 +38,43 @@ echo "==> 2/3 GGUF F16: ${LOCAL_DIR} -> ${GGUF}"
 [ -d .venv-convert ] || python3 -m venv .venv-convert
 .venv-convert/bin/python -m pip install -q --upgrade pip
 .venv-convert/bin/python -m pip install -q -r vendor/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+# scripts/verify_weights.py runs from this venv (it needs `gguf`) and reads the
+# experiment config, which upstream's requirements do not pull in.
+.venv-convert/bin/python -m pip install -q pyyaml
 .venv-convert/bin/python vendor/llama.cpp/convert_hf_to_gguf.py "${LOCAL_DIR}" \
     --outtype f16 --outfile "${GGUF}"
 
 echo "==> 3/3 Ollama import: ${GGUF} -> ${OLLAMA_TAG}"
 # NOT `ollama pull`: that would fetch Ollama's own Q4_K_M and break the
 # comparison. Importing the GGUF we just built keeps the weights identical.
+
+# `ollama create` is a client command -- it needs a server, and it writes into
+# whatever store that server was started with. Both have to match what
+# bench/run.py will later read, or the import lands in ~/.ollama and the
+# benchmark reports "model not found" for a model that was just built.
+export OLLAMA_MODELS="${ROOT}/vendor/ollama/models"
+mkdir -p "${OLLAMA_MODELS}"
+
+if curl -s --noproxy '*' -o /dev/null http://127.0.0.1:11434/ 2>/dev/null; then
+  echo "something is already listening on 11434 -- stop it first, so the import"
+  echo "cannot land in a different model store than the one this script sets."
+  exit 1
+fi
+
+IMPORT_LOG="$(mktemp)"
+"${ROOT}/vendor/ollama/bin/ollama" serve > "${IMPORT_LOG}" 2>&1 &
+OLLAMA_PID=$!
+# --noproxy: this machine exports http_proxy for 127.0.0.1, and curl would
+# otherwise ask the proxy about a server on loopback.
+trap 'kill "${OLLAMA_PID}" 2>/dev/null || true' EXIT
+for _ in $(seq 1 60); do
+  curl -s --noproxy '*' -o /dev/null http://127.0.0.1:11434/ 2>/dev/null && break
+  sleep 1
+done
+if ! curl -s --noproxy '*' -o /dev/null http://127.0.0.1:11434/ 2>/dev/null; then
+  echo "ollama serve did not come up; last lines:"; tail -20 "${IMPORT_LOG}"; exit 1
+fi
+
 printf 'FROM ./%s\n' "${GGUF}" > Modelfile
 "${ROOT}/vendor/ollama/bin/ollama" create "${OLLAMA_TAG}" -f Modelfile
 

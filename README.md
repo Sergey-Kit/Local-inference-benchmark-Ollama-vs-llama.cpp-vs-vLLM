@@ -281,21 +281,25 @@ python3 -m venv .venv && .venv/bin/python -m pip install -U pip
 
 bash scripts/build_llamacpp.sh    # source build; stock binaries SIGILL on this CPU
 bash scripts/install_ollama.sh    # local, no root, no systemd
+bash scripts/install_vllm.sh      # own venv; removes flashinfer, see below
 bash scripts/prepare_model.sh     # safetensors -> GGUF F16 -> Ollama import
-.venv/bin/python prompts/build_prompts.py
+.venv/bin/python prompts/build_prompts.py --count 400 --long-count 64
 
 .venv-convert/bin/python scripts/verify_weights.py   # must print IDENTICAL
-.venv/bin/python -m pytest                           # 47 tests
+.venv/bin/python -m pytest                           # 48 tests
 .venv/bin/python -m bench.run --dry-run
 ```
 
-vLLM lives in its own venv (it pins its own torch, ~10 GB):
+`prepare_model.sh` creates `.venv-convert` on the way through: the GGUF
+converter needs torch, and the measurement venv is kept light on purpose so it
+stays liftable into P2/P5. It also starts and stops its own Ollama server for
+the import, on the same model store `bench/run.py` will later read — an import
+into the default `~/.ollama` would leave the benchmark reporting "model not
+found" for a model that had just been built.
 
-```bash
-python3 -m venv .venv-vllm
-.venv-vllm/bin/python -m pip install -r requirements-vllm.txt
-.venv-vllm/bin/python -m pip uninstall -y flashinfer-python   # see that file
-```
+A CUDA 12.x toolkit must be present for the llama.cpp build. Ubuntu's packaged
+`nvidia-cuda-toolkit` is 11.5 and will not do; `build_llamacpp.sh` says so
+explicitly if it finds nothing at `CUDA_HOME`.
 
 Then, one runtime at a time — `bench/run.py` refuses to start if the port is
 already listening:

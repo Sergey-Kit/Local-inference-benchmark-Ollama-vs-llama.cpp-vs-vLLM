@@ -15,3 +15,6 @@ vllm==0.10.1.1
 #
 # and VLLM_USE_FLASHINFER_SAMPLER=0 (set in configs/experiment.yaml) stops the
 # probe from importing it at all.
+#
+# scripts/install_vllm.sh does all of this, and checks afterwards that
+# flashinfer really is gone.

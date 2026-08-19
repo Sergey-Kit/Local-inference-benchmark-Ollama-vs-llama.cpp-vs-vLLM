@@ -24,7 +24,19 @@ JOBS="${JOBS:-$(nproc)}"
 # whatever `nvcc` PATH happens to resolve to.
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 NVCC="${CUDA_HOME}/bin/nvcc"
-[ -x "${NVCC}" ] || { echo "no nvcc at ${NVCC}; set CUDA_HOME"; exit 1; }
+if [ ! -x "${NVCC}" ]; then
+    echo "No CUDA toolkit at ${CUDA_HOME}."
+    echo
+    echo "A CUDA 12.x toolkit is required, and note that Ubuntu's packaged"
+    echo "nvidia-cuda-toolkit will NOT do: it is 11.5, whose C++ frontend cannot"
+    echo "parse GCC 11's libstdc++ and fails with"
+    echo "    error: parameter packs not expanded with '...'"
+    echo "in <functional>. Install a 12.x toolkit from NVIDIA and point"
+    echo "CUDA_HOME at it, e.g. CUDA_HOME=/usr/local/cuda-12.3 $0"
+    echo
+    echo "Found on PATH: $(command -v nvcc || echo 'no nvcc at all')"
+    exit 1
+fi
 echo "using $("${NVCC}" --version | tail -2 | head -1)"
 
 [ -d "${SRC}" ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp "${SRC}"

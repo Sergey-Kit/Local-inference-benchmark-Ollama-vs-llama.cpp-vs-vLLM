@@ -16,3 +16,15 @@ huggingface-hub==1.28.0
 pandas==2.3.3
 matplotlib==3.10.9
 pytest==9.1.1
+
+# Needed by the setup scripts rather than by the harness itself, but installed
+# from here so `pip install -r requirements.txt` leaves the repo buildable
+# without any further hunting:
+#   cmake, ninja  -> scripts/build_llamacpp.sh (a pip cmake avoids needing root)
+#   jinja2        -> prompts/build_prompts.py, for apply_chat_template
+#   zstandard     -> scripts/install_ollama.sh; Ollama releases are .tar.zst and
+#                    this box has neither the zstd binary nor a tar built on it
+cmake==4.4.2
+ninja==1.13.0
+Jinja2==3.1.6
+zstandard==0.25.0
