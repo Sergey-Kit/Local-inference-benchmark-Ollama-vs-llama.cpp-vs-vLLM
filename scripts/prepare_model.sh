@@ -35,7 +35,13 @@ echo "==> 2/3 GGUF F16: ${LOCAL_DIR} -> ${GGUF}"
 [ -d vendor/llama.cpp ] || { echo "clone llama.cpp first (scripts/build_llamacpp.sh)"; exit 1; }
 # Its own venv: the converter needs torch, and the measurement venv is kept
 # light on purpose so it stays liftable into P2/P5.
-[ -d .venv-convert ] || python3 -m venv .venv-convert
+# Tested on the interpreter, not on the directory. A venv whose bin/ has been
+# removed -- by a stray clean, or by copying the tree without following symlinks
+# -- still passes `[ -d .venv-convert ]` while having no python at all, and the
+# very next line then fails with "No such file or directory" on a venv the
+# script has just decided it does not need to create. Found in exactly that
+# state before P2 needed it.
+[ -x .venv-convert/bin/python ] || python3 -m venv .venv-convert
 .venv-convert/bin/python -m pip install -q --upgrade pip
 .venv-convert/bin/python -m pip install -q -r vendor/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
 # scripts/verify_weights.py runs from this venv (it needs `gguf`) and reads the
