@@ -3,12 +3,11 @@
 One model, one set of weights, one measuring client, three runtimes — on a
 4 GB GPU that is old enough to make every constraint explicit.
 
-**Headline:** on this hardware **llama.cpp wins at every concurrency tested**,
-delivering **2.0× vLLM's throughput** and **1.4× Ollama's** at 16 concurrent
-requests. vLLM scales far better (**×5.5** from 1 to 16 concurrent requests
-against llama.cpp's ×2.1) but starts so far behind that it never catches up
-within the range this card can hold. The received wisdom — "vLLM wins on
-throughput" — is a statement about hardware this project did not have.
+**Headline:** llama.cpp is **5.4× faster than vLLM at one request at a time and
+1.07× faster at 32** — vLLM scales **×9.0** across that range against
+llama.cpp's ×1.8, and the curves cross just beyond the widest load this 4 GB
+card can hold. Both claims about vLLM are true at once, and which one you quote
+depends entirely on the concurrency you actually run at. That is the result.
 
 ![bench architecture](docs/architecture.png)
 
@@ -82,125 +81,158 @@ Limitations.
 
 ## 3. Results
 
+21 measurement points, three runtimes, **zero failed requests**.
 `results/summary.csv` holds every number; `results/raw/*.jsonl` holds every
 request.
 
-### Throughput vs concurrency
+### Throughput vs concurrency — the whole project in one figure
 
 ![throughput vs concurrency](analysis/figures/throughput_vs_concurrency.png)
 
-| concurrent requests | 1 | 4 | 8 | 16 | scaling 1→16 |
-|---|---|---|---|---|---|
-| **llama.cpp** | **65.5** | **91.7** | **99.9** | **139.9** | ×2.14 |
-| **Ollama** | 42.9 | 67.1 | 78.4 | 100.8 | ×2.35 |
-| **vLLM** | 12.5 | 20.7 | 38.3 | 68.6 | **×5.48** |
+| concurrent requests | 1 | 4 | 8 | 16 | 32 | scaling 1→32 |
+|---|---|---|---|---|---|---|
+| **llama.cpp** | **69.6** | **102.7** | **117.3** | **103.7** | **125.4** | ×1.80 |
+| **Ollama** | 43.3 | 80.6 | 94.5 | 84.4 | 90.8 | ×2.10 |
+| **vLLM** | 13.0 | 21.7 | 38.7 | 69.7 | 116.9 | **×8.99** |
 
 *output tokens/s, median of 3 runs, 64-token prompts*
 
-The shape matters more than the ranking. vLLM's continuous batching is doing
-exactly what it is advertised to do — it is the only runtime whose throughput
-grows faster than 2.5× across the range — but it begins at a fifth of
-llama.cpp's single-stream rate, and 16 concurrent requests is not enough runway.
-Extrapolating the two curves, the crossover sits somewhere past concurrency 30;
-vLLM's KV cache here holds 17,792 tokens, i.e. about 34 concurrent 512-token
-requests, so that crossover is *just* inside what this card could physically
-hold and outside what was measured.
+llama.cpp's lead collapses as the load rises:
 
-### TTFT, single stream
+| concurrency | 1 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| llama.cpp ÷ vLLM | 5.35× | 4.73× | 3.03× | 1.49× | **1.07×** |
+
+At one request at a time vLLM is five times slower. At 32 it is seven percent
+slower, still accelerating, and it has already overtaken Ollama. Its curve is
+the only convex one on the chart — the signature of continuous batching, which
+amortises a fixed per-step cost over more sequences the more of them there are.
+The other two flatten, and both dip at concurrency 16 in the same way, which is
+unsurprising: Ollama *is* llama.cpp underneath, and the two share the shape.
+
+**The crossover is just past 32, and 32 is the edge of this card.** vLLM's KV
+pool holds 17,792 tokens — about 34 concurrent 512-token sequences — so one more
+doubling is not physically available here. That is the honest boundary of this
+experiment: the trend across five points is unambiguous, the crossing itself is
+one step beyond reach.
+
+### TTFT and TPOT
 
 ![TTFT single stream](analysis/figures/ttft_single_stream.png)
 
+Single stream, where llama.cpp is at its strongest:
+
 | | llama.cpp | vLLM | Ollama |
 |---|---|---|---|
-| TTFT p50 | **190 ms** | 308 ms | 553 ms |
-| TTFT p95 | 219 ms | 333 ms | 574 ms |
-| TPOT p50 | **12.2 ms** | 76.3 ms | 14.8 ms |
+| TTFT p50 | **183 ms** | 321 ms | 541 ms |
+| TTFT p95 | **209 ms** | 340 ms | 585 ms |
+| TPOT p50 | **11.7 ms** | 73.0 ms | 14.6 ms |
 
-vLLM's TPOT — 76 ms/token against llama.cpp's 12 — is the cost of
-`--enforce-eager`. CUDA graph capture is what removes vLLM's per-step Python
-overhead, and it needs several hundred MiB of VRAM this card cannot spare. On a
-0.6B model that overhead is most of the step.
+vLLM's 73 ms/token is the price of `--enforce-eager`. CUDA graph capture is what
+removes its per-step Python overhead, and it needs several hundred MiB this card
+cannot spare. On a 0.6B model that overhead *is* most of the step — which is
+exactly why the deficit evaporates under load, as the same fixed cost gets
+divided across 32 sequences:
 
-Ollama and llama.cpp share an engine, and their TPOT agrees to within 20%. The
-gap between them is almost entirely per-request overhead, which is where a
+| TPOT p50, ms | 1 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| llama.cpp | 11.7 | 56.3 | 141.7 | 228.4 |
+| vLLM | 73.0 | 180.8 | 196.9 | **236.5** |
+
+By concurrency 32 the two are within 4%. And vLLM's tail is already better:
+TTFT p95 at 32 is 4159 ms against llama.cpp's 4287 ms.
+
+Ollama and llama.cpp agree on TPOT to within 5% at every point — they share an
+engine. The whole gap between them is per-request overhead, which is where a
 convenience layer would be expected to put it.
 
 ### Peak VRAM
 
 ![peak VRAM](analysis/figures/peak_vram.png)
 
+At concurrency 32, over an idle baseline of ~550 MiB:
+
 | | llama.cpp | Ollama | vLLM |
 |---|---|---|---|
-| peak VRAM over idle | 2335 MiB | **2177 MiB** | 3327 MiB |
-| peak host RSS | 2074 MiB | **1669 MiB** | 3227 MiB |
+| peak VRAM | 3301 MiB | **3090 MiB** | 3385 MiB |
+| peak host RSS | 2790 MiB | **2431 MiB** | 3229 MiB |
 
 **These are not the same measurement.** vLLM reserves its pool up front from
 `--gpu-memory-utilization 0.80`, so its figure is a *reservation*; the other two
-are high-water marks. vLLM would run in less, and llama.cpp would use more if
-asked for more slots.
+are high-water marks.
 
-WSL2 does not report per-process GPU memory — `nvidia-smi
---query-compute-apps` returns an empty table — so peak VRAM is device-wide
-`used` minus a baseline captured immediately before each launch. The baseline is
-the Windows desktop's share and it drifts: it was observed moving between 385
-and 860 MiB within one session, which is why it is never reused across servers.
+WSL2 does not report per-process GPU memory — `nvidia-smi --query-compute-apps`
+returns an empty table — so peak VRAM is device-wide `used` minus a baseline
+captured immediately before each launch. That baseline is the Windows desktop's
+share and it drifts between 385 and 860 MiB across a session, which is why it is
+never reused across servers.
 
-### Long prompt vs short: prefill dominates
+### Long prompt vs short: prefill dominates and flattens everything
 
 ![TTFT short vs long](analysis/figures/ttft_prompt_length.png)
 
-| TTFT p50, concurrency 1 | 64-token prompt | 2560-token prompt | ratio |
+| TTFT p50, concurrency 1 | 64 tokens | 2560 tokens | ratio |
 |---|---|---|---|
-| llama.cpp | 185 ms | **6165 ms** | 33.4× |
-| Ollama | 538 ms | 7045 ms | 13.1× |
-| vLLM | 309 ms | 6539 ms | 21.2× |
+| llama.cpp | 180 ms | **6229 ms** | 34.6× |
+| vLLM | 309 ms | 6544 ms | 21.2× |
+| Ollama | 549 ms | 7169 ms | 13.1× |
 
-A 40× longer prompt costs 13–33× more time to first token, and all three
+A 40× longer prompt costs 13–35× more time to first token, and the three
 runtimes land within 15% of each other — because at this length they are all
-doing the same thing, and it is the GPU doing it. llama.cpp's own log puts
+doing the same thing and it is the GPU doing it. llama.cpp's own log puts
 prefill at ~430 tokens/s: six seconds of prompt processing against under one
 second of generation.
 
-**For long-context work on this class of card, prefill is the product.** Token
-generation speed, the number everyone quotes, is noise by comparison.
+**For long-context work on this class of card, prefill is the product**, and the
+runtime you pick barely matters.
 
 ### Cold start
 
 | | llama.cpp | Ollama | vLLM |
 |---|---|---|---|
-| process start → first completed generation | **2.1 s** | 7.3 s | 61.1 s |
+| process start → first completed generation | **2.4 s** | 11.4 s | 71.1 s |
 
 Measured to a *completed generation*, not to a healthy port: llama-server binds
 its port about three seconds before it can answer, so timing to readiness would
-have flattered it by more than its whole cold start.
+have flattered it by more than its entire cold start.
+
+### Are they doing equal work?
+
+Without `ignore_eos` each runtime stops when it decides to, so the median output
+length is the check that they are not:
+
+| output tokens p50 | 1 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| llama.cpp | 65.5 | 65 | 65 | 64 | 64 |
+| Ollama | 65 | 65 | 63 | 64.5 | 64 |
+| vLLM | 65 | 65 | 66 | 65 | 65 |
+
+Same weights, same prompts, same sampling, same amount of generated text. The
+throughput differences above are differences in speed, not in workload.
 
 ---
 
 ## 4. When to use which
 
-**llama.cpp** — the default here, and it is not close. Fastest at every
-concurrency, lowest TTFT, lowest TPOT, 2.1 s cold start. The cost is
-operational: you build it yourself (mandatory on this CPU — see below), you
-manage the process, and there is no model management to speak of.
+**Below concurrency ~16, llama.cpp, and it is not close.** 5.4× vLLM at a single
+stream, the lowest TTFT and TPOT of the three, and a 2.4 s cold start. You build
+it yourself — mandatory on this CPU — and you manage the process.
 
-**Ollama** — 72% of llama.cpp's throughput at concurrency 16 and 2.9× its TTFT,
-in exchange for model management, an import/registry workflow, and a server that
-stays up. It is the same engine underneath; you are paying for the wrapper in
-per-request latency, not in token generation speed. A reasonable trade for
-interactive and internal tools, a poor one under load.
+**Above concurrency ~32, vLLM, and the trend says the gap keeps widening in its
+favour.** It is 7% behind at 32 while still accelerating; llama.cpp has
+flattened. If your service holds tens of concurrent streams, the ranking at
+concurrency 1 tells you nothing useful about it.
 
-**vLLM** — not on this hardware. It loses at every concurrency tested, needs a
-minute to start, cannot use quantized weights on sm75, and needs `--enforce-eager`
-on 4 GB, which is precisely what makes its per-token cost 6× llama.cpp's. But
-its scaling curve is the steepest of the three by a factor of 2.5, and that is
-the property it is actually built for: on a card that can hold hundreds of
-concurrent sequences and run CUDA graphs, the ranking in this table should
-invert. **The lesson is not "vLLM is slow" — it is that vLLM's advantage is
-purchased with VRAM, and this card has none to spare.**
+**Ollama when the operational story matters more than the numbers.** 72% of
+llama.cpp's throughput and 3× its TTFT, in exchange for model management and a
+server that stays up. It is the same engine underneath; you are paying the
+wrapper in per-request latency, not in token generation. Note that it is the
+only one of the three that will quietly move layers to the CPU rather than fail
+— see Limitations.
 
-**If your prompts are long**, the choice matters much less than it appears: all
-three converge to within 15% because prefill dominates, and you should be
-shopping for a faster GPU rather than a different runtime.
+**If your prompts are long, none of this matters much.** All three converge
+within 15% because prefill dominates; buy a faster GPU rather than switch
+runtime.
 
 ---
 
@@ -212,9 +244,9 @@ Stated plainly, because several of them are the whole point.
    to use quantized weights on sm75. Absolute numbers do not transfer to larger
    models; the shapes of the curves are more likely to.
 2. **vLLM ran with `--enforce-eager`.** CUDA graphs need VRAM this card cannot
-   spare. This is a genuine handicap and a large part of why vLLM's TPOT is 6×
-   llama.cpp's. It is a real constraint of the hardware, not a misconfiguration,
-   but a 4 GB result should not be read as a verdict on vLLM.
+   spare, and that is most of its single-stream deficit. A real constraint of
+   the hardware, not a misconfiguration — but a 4 GB result is not a verdict on
+   vLLM, and the crossover would move left on a card that can run graphs.
 3. **Peak VRAM is not comparable across runtimes** — reservation vs high-water
    mark, as described above.
 4. **Ollama is measured through `/api/generate`, not `/v1/completions`.** Its
@@ -237,14 +269,24 @@ Stated plainly, because several of them are the whole point.
 7. **Three runs per point.** Enough for the 1–3% run-to-run spread observed
    after fixing the leak-driven degradation, not enough for tight confidence
    intervals.
-8. **Single machine, single session.** No thermal steady-state control beyond
+8. **Every runtime was pinned to the GPU explicitly.** Ollama is given
+   `num_gpu: 99`, matching llama.cpp's `-ngl 99`. Left to itself at 32 slots it
+   concludes the model will not fit and leaves 9 of 29 layers on the CPU, which
+   costs 5× on this machine. llama.cpp's fitter reaches the same verdict and is
+   overruled by the flag. Worth knowing if you deploy Ollama on a small card
+   without setting this: it will not fail, it will just be slow.
+9. **The load is closed-loop.** Concurrency N means N requests in flight, each
+   replaced the instant it finishes — N busy users with no think time, not a
+   request rate. Production traffic is usually open-loop, where queueing behaves
+   differently.
+10. **Single machine, single session.** No thermal steady-state control beyond
    discarding warm-up.
 
 ---
 
 ## 6. What this cost to get right
 
-Nine defects were found in the harness or its configuration during this project.
+Ten defects were found in the harness or its configuration during this project.
 **None of them produced an error. Every one produced plausible numbers.** They
 are documented because the failure mode is the interesting part:
 
@@ -259,6 +301,7 @@ are documented because the failure mode is the interesting part:
 | `env:` block built but never passed to `Popen` | Ollama measured at default parallelism |
 | Ollama's OpenAI layer re-templating the prompt | 72 tokens vs 64, and a different task |
 | `OLLAMA_FLASH_ATTENTION=0`, set for tidiness | Ollama 5.4× slower on TTFT |
+| Ollama silently leaving 9 of 29 layers on the CPU | "Ollama collapses at 32 slots" — 8.4 tok/s vs 43.3 |
 
 The last one is the most instructive. It was set deliberately — sm75 has no
 FlashAttention-2, so stating it explicitly seemed more rigorous than leaving it
@@ -337,9 +380,9 @@ never came up.
 
 ## 8. What next
 
-* **Concurrency 32.** vLLM's KV budget here holds ~34 concurrent 512-token
-  sequences, so the crossover point the curves imply is measurable on this card
-  rather than extrapolated. This is the single highest-value addition.
+* **Concurrency 64 and beyond**, on a card with the KV budget for it. The
+  crossover is one step past the widest load this 4 GB card can hold, so the
+  crossing itself is the one number this project could not measure.
 * **`--enforce-eager` vs CUDA graphs**, on a card with the VRAM for both, to
   separate "vLLM on 4 GB" from "vLLM".
 * **Quantization** — the same harness against Q4_K_M/Q6_K/IQ2_XXS on

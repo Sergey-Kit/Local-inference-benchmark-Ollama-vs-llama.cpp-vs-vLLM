@@ -94,6 +94,36 @@ in **both** cases, so the setting responsible for a 5.4x difference does not
 appear in the configuration the server reports. Leaving it unset also matches
 llama-server, which is likewise left on its default.
 
+## Set num_gpu, or it will run on the CPU without telling you
+
+The benchmark passes `num_gpu: 99` in the request options -- Ollama's
+equivalent of llama.cpp's `-ngl 99`. Without it, at 32 slots:
+
+```
+load_tensors: offloaded 20/29 layers to GPU
+load_tensors:    CUDA_Host model buffer size =   566.83 MiB
+sched_reserve: graph splits = 119
+```
+
+The KV cache for 32 x 512 tokens needs 1792 MiB, Ollama's memory fitter decides
+the model will not fit, and nine of twenty-nine layers stay on the CPU. On this
+machine -- no AVX2, PCIe 2.0 -- that costs **5x**: 8.4 tok/s against 43.3 at
+concurrency 1. Nothing in the API response says so; the single-slot profile is
+unaffected, which is what makes the collapse look like a runtime property.
+
+The instructive part is llama.cpp's log, same hardware, same profile:
+
+```
+failed to fit params to free device memory:
+n_gpu_layers already set by user to 99, abort
+```
+
+The same fitter reaches the same verdict and is overruled by the flag. It then
+runs fine at 3437 MiB and 125 tok/s -- the fitter was simply wrong, and only one
+of the two runtimes was in a position to find out.
+
+With `num_gpu: 99`: 29/29 layers on GPU, graph splits down from 119 to 2.
+
 ## Known deviation
 
 Ollama does not support `ignore_eos`. The benchmark runs without it on every
