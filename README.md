@@ -43,15 +43,32 @@ The harness (`bench/`) is written to be lifted into later projects unchanged.
 
 ### Why FP16 and why 0.6B
 
-Both fall out of the GPU rather than from preference. vLLM's quantized kernels
-require compute capability ≥ 8.0 and refuse to load on sm75, so vLLM can only
-serve unquantized weights here — which caps the model at roughly 1.5B in 4 GB
-once a usable KV cache is subtracted.
+> **Correction (P2).** This section originally said vLLM's quantized kernels
+> require compute capability ≥ 8.0 and refuse to load on sm75. **That is wrong
+> for vLLM 0.27.1 and it was never measured here.** P2 built a 4-bit AWQ
+> checkpoint from these same Qwen3-0.6B weights and served it on this card:
+> vLLM selected `MarlinLinearKernel for CompressedTensorsWNA16`, answered
+> /health in 63 s and generated correct text. vLLM's own gates say the same —
+> AWQ declares min capability 75, GPTQ 60, and Marlin is refused only below 75.
+> sm75 is 75. The one sm80 message in the launch log is about
+> FlashAttention-2, an attention backend unrelated to quantized weights, and is
+> the likely source of the claim. Evidence: `results/vllm_probe.json` in P2.
+>
+> **What this changes and what it does not.** The measurements below stand
+> unaltered: all three runtimes were given the same FP16 weights, and that is
+> verified by hash, not by argument. What was wrong is the *reason* given for
+> choosing FP16. The honest version is that FP16 was a deliberate choice which
+> makes quantization a non-variable — a good choice, but not a forced one.
 
-That constraint turned out to be a gift. Since vLLM must run FP16, llama.cpp and
-Ollama can be given a GGUF converted from **the same safetensors at F16**, and
-quantization stops being a variable of the experiment instead of being a caveat
-at the bottom of the page.
+FP16 and 0.6B are chosen so that quantization is not a variable. A quantized
+model would have to be quantized differently for each runtime — GGUF for
+llama.cpp and Ollama, AWQ or GPTQ for vLLM — and "same weights" would become an
+argument rather than a checksum. At F16 all three consume the same tensors from
+the same safetensors, which `scripts/verify_weights.py` proves.
+
+0.6B follows from 4 GB once a usable KV cache is subtracted: at FP16 the card
+holds roughly 1.5B of weights before the cache is paid for, and the concurrency
+sweep needs 32 slots of it.
 
 ### The weights really are the same
 
@@ -240,9 +257,10 @@ runtime.
 
 Stated plainly, because several of them are the whole point.
 
-1. **The model is 0.6B, not 7–8B.** Forced by 4 GB of VRAM and vLLM's inability
-   to use quantized weights on sm75. Absolute numbers do not transfer to larger
-   models; the shapes of the curves are more likely to.
+1. **The model is 0.6B, not 7–8B.** Forced by 4 GB of VRAM at FP16, and FP16 is
+   chosen so that "the same weights" stays a checksum rather than an argument —
+   see the correction under "Why FP16 and why 0.6B". Absolute numbers do not
+   transfer to larger models; the shapes of the curves are more likely to.
 2. **vLLM ran with `--enforce-eager`.** CUDA graphs need VRAM this card cannot
    spare, and that is most of its single-stream deficit. A real constraint of
    the hardware, not a misconfiguration — but a 4 GB result is not a verdict on
