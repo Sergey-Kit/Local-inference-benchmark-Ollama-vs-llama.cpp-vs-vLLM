@@ -1,0 +1,42 @@
+# Packaging exists for one reason: P2 and P5 must be able to *install* this
+# harness rather than copy it. A copied bench/ is a fork that silently drifts,
+# and the moment the measuring code differs between projects their numbers stop
+# being comparable -- which is the failure this repo is built to avoid.
+#
+#   pip install -e /path/to/p1-inference-benchmark
+#
+# Only the measuring surface is packaged: bench/ (client, metrics, monitor,
+# orchestrator) and prompts/ (the builder that applies the chat template exactly
+# once). analysis/ and scripts/ are P1's own reporting and setup, and are
+# deliberately left out -- a downstream project has different figures to draw.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p1-inference-benchmark"
+version = "1.0.0"
+description = "Runtime-agnostic LLM inference measuring harness (TTFT/TPOT/throughput/peak VRAM)"
+requires-python = ">=3.10"
+
+# The versions the reported P1 results were produced with, pinned exactly and
+# kept in step with requirements.txt. A downstream project that installs this
+# and gets a different httpx is not reproducing P1's measurement.
+dependencies = [
+    "httpx==0.28.1",
+    "PyYAML==6.0.3",
+    "nvidia-ml-py==13.610.43",   # bench/monitor.py, imported as pynvml
+    "psutil==7.2.2",
+    "transformers==5.15.0",      # tokenizer of record, shared across runtimes
+    "huggingface-hub==1.28.0",
+    "Jinja2==3.1.6",             # prompts/build_prompts.py, apply_chat_template
+]
+
+[tool.setuptools]
+packages = ["bench", "prompts"]
+
+[tool.setuptools.package-data]
+# The prompt set itself travels with the package: P2 measures the same prompts
+# P1 did, and regenerating them from a different transformers build would be a
+# silent change of the experiment.
+prompts = ["prompts.jsonl"]
