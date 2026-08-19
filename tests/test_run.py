@@ -387,3 +387,20 @@ class TestVramBudget:
         assert kv + weights + desktop < 4096, (
             f"KV {kv:.0f} + weights {weights} + desktop {desktop} exceeds the card"
         )
+
+
+class TestOllamaLayerOffload:
+    def test_all_layers_are_pinned_to_the_gpu(self, cfg):
+        """Ollama must be told to keep the model on the GPU, as llama.cpp is.
+
+        Left to decide, its memory fitter offloads 9 of 29 layers to the CPU at
+        32 slots -- costing 5x on this machine -- while llama.cpp, given
+        -ngl 99, overrides the same verdict from the same fitter and runs fine.
+        Without this the comparison measures layer placement, not runtimes.
+        """
+        options = cfg["runtimes"]["ollama"].get("options") or {}
+        assert options.get("num_gpu", 0) >= 29, "Qwen3-0.6B has 28 layers + output"
+
+    def test_llamacpp_pins_them_too(self, cfg):
+        cmd = [str(x) for x in cfg["runtimes"]["llamacpp"]["command"]]
+        assert int(cmd[cmd.index("-ngl") + 1]) >= 29

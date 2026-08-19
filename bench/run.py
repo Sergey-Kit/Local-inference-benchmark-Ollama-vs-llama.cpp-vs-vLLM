@@ -285,6 +285,7 @@ async def server_session(cfg, runtime, profile_name, profile, count_tokens, out_
             timeout_s=float(cfg["measurement"]["request_timeout_s"]),
             count_tokens=count_tokens,
             api=rt.get("api", "openai"),
+            options=rt.get("options"),
         ) as client:
             monitor.start()
             try:

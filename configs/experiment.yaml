@@ -193,6 +193,23 @@ runtimes:
     # Ollama's OpenAI layer does not forward ignore_eos. Recorded as a known
     # deviation; the client falls back to counting tokens actually returned.
     supports_ignore_eos: false
+    options:
+      # Ollama's equivalent of llama.cpp's -ngl 99, and required for the two to
+      # be comparable at all. At 32 slots the KV cache needs 1792 MiB, and
+      # Ollama's memory fitter concludes the model does not fit and quietly
+      # leaves 9 of 29 layers on the CPU:
+      #     load_tensors: offloaded 20/29 layers to GPU
+      #     sched_reserve: graph splits = 119
+      # On this CPU, without AVX2 and across PCIe 2.0, that costs 5x -- 8.4
+      # tok/s against 42.9 at concurrency 1.
+      #
+      # llama.cpp's fitter reaches the same conclusion on the same hardware:
+      #     failed to fit params to free device memory:
+      #     n_gpu_layers already set by user to 99, abort
+      # It was simply told what to do, ignored the verdict, and ran fine at
+      # 3437 MiB. The fitter was wrong; only one of the two runtimes was in a
+      # position to find out. Asking Ollama explicitly puts them on equal terms.
+      num_gpu: 99
 
   vllm:
     base_url: http://127.0.0.1:8000/v1

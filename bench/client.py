@@ -53,7 +53,7 @@ class ApiStyle:
     path = "/completions"
 
     def payload(self, model: str, prompt: str, sampling: "Sampling",
-                ignore_eos: bool) -> dict:
+                ignore_eos: bool, extra: dict | None = None) -> dict:
         body = {
             "model": model,
             "prompt": prompt,
@@ -68,6 +68,7 @@ class ApiStyle:
         }
         if ignore_eos:
             body["ignore_eos"] = True
+        body.update(extra or {})
         return body
 
     def probe(self, model: str) -> dict:
@@ -128,7 +129,7 @@ class OllamaNativeStyle(ApiStyle):
     path = "/api/generate"
 
     def payload(self, model: str, prompt: str, sampling: "Sampling",
-                ignore_eos: bool) -> dict:
+                ignore_eos: bool, extra: dict | None = None) -> dict:
         return {
             "model": model,
             "prompt": prompt,
@@ -138,6 +139,7 @@ class OllamaNativeStyle(ApiStyle):
                 "num_predict": sampling.max_tokens,
                 "temperature": sampling.temperature,
                 "top_p": sampling.top_p,
+                **(extra or {}),
             },
         }
 
@@ -206,6 +208,7 @@ class RuntimeClient:
         count_tokens: Callable[[str], int] | None = None,
         token_mismatch_tolerance: float = 0.03,
         api: str = "openai",
+        options: dict | None = None,
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
@@ -218,6 +221,9 @@ class RuntimeClient:
         if api not in API_STYLES:
             raise ValueError(f"unknown api style {api!r}; expected one of {sorted(API_STYLES)}")
         self.style: ApiStyle = API_STYLES[api]()
+        # Runtime-specific request options, e.g. Ollama's num_gpu. Empty for
+        # everyone else, so their payloads are unchanged.
+        self.options = dict(options or {})
         self._client: httpx.AsyncClient | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -299,6 +305,7 @@ class RuntimeClient:
         return self.style.payload(
             self.served_model, prompt, sampling,
             sampling.ignore_eos and self.supports_ignore_eos,
+            self.options,
         )
 
     async def one_request(
