@@ -56,11 +56,17 @@ echo "using $("${NVCC}" --version | tail -2 | head -1)"
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF
 
+# llama-perplexity and llama-imatrix are not used by P1's measurements, but they
+# are built here rather than in P2 on purpose: quantizing, calibrating and
+# scoring a model with a *different* llama.cpp build than the one that served it
+# would make the quality numbers and the speed numbers describe two different
+# programs. One configure, one commit, one ISA -- all six tools.
 "${CMAKE}" --build "${SRC}/build" --config Release -j "${JOBS}" \
-    --target llama-server llama-cli llama-bench llama-quantize
+    --target llama-server llama-cli llama-bench llama-quantize \
+             llama-perplexity llama-imatrix
 
 echo
 echo "built:"
-ls -la "${SRC}/build/bin/" | grep -E "llama-(server|cli|bench|quantize)"
+ls -la "${SRC}/build/bin/" | grep -E "llama-(server|cli|bench|quantize|perplexity|imatrix)"
 echo
 echo "llama.cpp commit: $(git -C "${SRC}" rev-parse --short HEAD)"
